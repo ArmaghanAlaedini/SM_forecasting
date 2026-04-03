@@ -1,2 +1,3 @@
 __pycache__/
-*.pycstations_full.csv
+*.pyc
+stations_full.csv
