@@ -1,0 +1,24 @@
+name: py310
+channels:
+  - conda-forge
+  - defaults
+  - gurobi
+dependencies:
+  - python=3.10
+  - numpy
+  - seaborn
+  - jupyterlab
+  - pykrige
+  - gurobi
+  - h5netcdf
+  - h5py
+  - matplotlib
+  - netcdf4
+  - xarray
+  - pandas
+  - black
+  - tk
+  - ipython
+  - pyinterpolate
+  - scikit-learn
+
