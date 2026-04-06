@@ -33,4 +33,5 @@ print(stations_full[['station', 'station_name', 'lat', 'lon', 'elev', 'iem_netwo
 print(stations_full[['lat', 'lon']].isna().sum()) # check for missing lat/lon values after merge
 
 print(stations_meta['stid'].duplicated().sum()) # no duplicates in metadata 
+stations_full.columns
 stations_full.to_csv('stations_full.csv', index=False)
