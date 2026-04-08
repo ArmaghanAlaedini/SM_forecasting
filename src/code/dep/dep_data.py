@@ -35,8 +35,8 @@ PROJECT_ROOT = _find_project_root(_START)
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
-from src.config.paths import RAW_GFS_CSV, PROC_GFS, ensure_dirs
+from src.config.paths import RAW_DEP_CSV, PROC_DEP, ensure_dirs
 
 ensure_dirs()
 
-df_gfs = pd.read_csv(RAW_GFS_CSV)
+df_dep = pd.read_csv(RAW_DEP_CSV)
