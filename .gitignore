@@ -1,3 +1,59 @@
+
+# -----------------------------
+# R / renv
+# -----------------------------
+.Rhistory
+.RData
+.Ruserdata
+.Rproj.user/
+
+renv/library/
+renv/local/
+renv/staging/
+renv/python/
+
+# Keep the important renv files tracked
+!renv/activate.R
+!renv/settings.json
+!renv.lock
+!.Rprofile
+
+# -----------------------------
+# Python
+# -----------------------------
 __pycache__/
 *.pyc
-stations_full.csv
+*.pyo
+*.pyd
+
+test.py
+
+# -----------------------------
+# VS Code / editor junk
+# -----------------------------
+.vscode/
+*.swp
+*~
+
+# -----------------------------
+# OS junk
+# -----------------------------
+.DS_Store
+Thumbs.db
+
+# -----------------------------
+# Raw and large data
+# -----------------------------
+*.nc4
+*.h5
+*.hdf5
+*.rds
+*.RDS
+*.csv.gz
+
+# -----------------------------
+# Project outputs / generated files
+# -----------------------------
+
+src/smap/
+src/data/
