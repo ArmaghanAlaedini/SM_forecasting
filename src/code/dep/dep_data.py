@@ -40,3 +40,8 @@ from src.config.paths import RAW_DEP_CSV, PROC_DEP, ensure_dirs
 ensure_dirs()
 
 df_dep = pd.read_csv(RAW_DEP_CSV)
+
+print("dep path:", RAW_DEP_CSV / "DEP_20260405.csv")
+
+print(df_dep.head())
+print(df_dep.columns.tolist())
