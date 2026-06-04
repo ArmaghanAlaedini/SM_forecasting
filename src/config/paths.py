@@ -4,7 +4,11 @@ from pathlib import Path
 def _find_project_root(start: Path) -> Path:
     """
     Walk upward until we find the project root.
-    Expected markers: .git or environment.yml plus src/.
+
+    Expected markers:
+    - .git
+    OR
+    - environment.yml plus src/
     """
     start = start.resolve()
     base = start if start.is_dir() else start.parent
@@ -26,6 +30,11 @@ try:
 except NameError:
     _START = Path.cwd().resolve()
 
+
+# ------------------------------------------------------------
+# Main project folders
+# ------------------------------------------------------------
+
 ROOT = _find_project_root(_START)
 
 SRC = ROOT / "src"
@@ -36,11 +45,25 @@ DATA = SRC / "data"
 RAW = DATA / "raw"
 PROCESSED = DATA / "processed"
 
+
+# ------------------------------------------------------------
+# Raw data folders
+# ------------------------------------------------------------
+
 RAW_DEP = RAW / "dep"
 RAW_GFS = RAW / "gfs"
 RAW_ISU = RAW / "isu_stations"
 RAW_SMAP_OBS = RAW / "smap_observations"
 RAW_TOWNSHIPS = RAW / "townships"
+
+# Archived weather raw/cache folders
+RAW_ARCHIVED_WEATHER = RAW / "archived_weather"
+RAW_ARCHIVED_HRRR = RAW_ARCHIVED_WEATHER / "hrrr"
+
+
+# ------------------------------------------------------------
+# Processed data folders
+# ------------------------------------------------------------
 
 PROC_DEP = PROCESSED / "dep"
 PROC_GFS = PROCESSED / "gfs"
@@ -54,17 +77,36 @@ PROC_SMAP = PROCESSED / "smap_processed"
 PROC_SMAP_AM = PROC_SMAP / "am"
 PROC_SMAP_PM = PROC_SMAP / "pm"
 
+# Archived weather processed folders
+PROC_ARCHIVED_WEATHER = PROCESSED / "archived_weather"
+PROC_ARCHIVED_HRRR = PROC_ARCHIVED_WEATHER / "hrrr"
+
+
+# ------------------------------------------------------------
+# Common input files
+# ------------------------------------------------------------
+
 RAW_DEP_CSV = RAW_DEP / "DEP_20260405.csv"
 RAW_GFS_CSV = RAW_GFS / "gfs.csv"
+
 RAW_ISU_STATIONS = RAW_ISU / "stations.csv"
 RAW_ISU_META = RAW_ISU / "stations_meta.csv"
+
 RAW_TOWNSHIPS_SHP = RAW_TOWNSHIPS / "civil_townships_a_ia.shp"
 
 PROC_ISU_STATIONS_FULL = PROC_ISU / "stations_full.csv"
 
 
 def ensure_dirs() -> None:
+    """
+    Create project folders that are expected to exist.
+
+    This does not download data.
+    It only creates empty folders if they are missing.
+    """
     for path in [
+        RAW_ARCHIVED_WEATHER,
+        RAW_ARCHIVED_HRRR,
         PROC_DEP,
         PROC_GFS,
         PROC_ISU,
@@ -74,5 +116,7 @@ def ensure_dirs() -> None:
         PROC_SMAP,
         PROC_SMAP_AM,
         PROC_SMAP_PM,
+        PROC_ARCHIVED_WEATHER,
+        PROC_ARCHIVED_HRRR,
     ]:
         path.mkdir(parents=True, exist_ok=True)

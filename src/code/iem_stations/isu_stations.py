@@ -2,7 +2,8 @@
 from pathlib import Path
 import sys
 import pandas as pd
-
+import geopandas as gpd
+import matplotlib.pyplot as plt
 
 def _find_project_root(start: Path) -> Path:
     """
@@ -80,4 +81,30 @@ print(stations_full[["lat", "lon"]].isna().sum())
 print("Duplicate stid in metadata:", stations_meta["stid"].duplicated().sum())
 
 stations_full.to_csv(PROC_ISU_STATIONS_FULL, index=False)
+
+station_list = (
+    stations_full[["station", "station_name", "lat", "lon", "elev", "iem_network"]]
+    .drop_duplicates()
+    .sort_values("station")
+)
+
+station_list.shape
+print(station_list)
+
 print("Saved to:", PROC_ISU_STATIONS_FULL)
+
+
+
+import matplotlib.pyplot as plt
+
+plt.figure(figsize=(10, 8))
+plt.scatter(station_list["lon"], station_list["lat"])
+
+for _, row in station_list.iterrows():
+    plt.text(row["lon"], row["lat"], row["station"], fontsize=8)
+
+plt.xlabel("Longitude")
+plt.ylabel("Latitude")
+plt.title("ISU Station Locations with Station IDs")
+plt.grid(True)
+plt.show() # Adel station is not working
