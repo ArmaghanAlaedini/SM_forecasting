@@ -31,27 +31,40 @@ src/data/processed/smap_gap_filling/05_gapfill_model_validation/comparison/
 
 from __future__ import annotations
 
+import importlib.util
 from pathlib import Path
-import textwrap
+
 import pandas as pd
+import matplotlib
+matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
 
 # ============================================================
-# CONFIG
+# LOAD CONFIG  ← FIXED: no more hardcoded /home/armaghan path
 # ============================================================
 
-PROJECT_ROOT = Path("/home/armaghan/projects/SM_forecasting")
+def load_config():
+    config_path = Path(__file__).resolve().with_name("00_config.py")
+    spec = importlib.util.spec_from_file_location("cfg", config_path)
+    cfg = importlib.util.module_from_spec(spec)
+    if spec.loader is None:
+        raise ImportError(f"Could not load config from {config_path}")
+    spec.loader.exec_module(cfg)
+    return cfg
 
-VALIDATION_DIR = (
-    PROJECT_ROOT
-    / "src/data/processed/smap_gap_filling/05_gapfill_model_validation"
-)
 
-ML_METRICS_PATH = VALIDATION_DIR / "ml/ml_validation_metrics.csv"
-INTERP_METRICS_PATH = (
-    VALIDATION_DIR / "interpolation/interpolation_validation_metrics.csv"
-)
+cfg = load_config()
+
+
+# ============================================================
+# PATHS  ← all derived from config, not hardcoded
+# ============================================================
+
+VALIDATION_DIR = cfg.GAP_FILLING_DIR / "05_gapfill_model_validation"
+
+ML_METRICS_PATH = VALIDATION_DIR / "ml" / "ml_validation_metrics.csv"
+INTERP_METRICS_PATH = VALIDATION_DIR / "interpolation" / "interpolation_validation_metrics.csv"
 
 OUT_DIR = VALIDATION_DIR / "comparison"
 FIG_DIR = OUT_DIR / "figures"
@@ -59,17 +72,22 @@ FIG_DIR = OUT_DIR / "figures"
 OUT_DIR.mkdir(parents=True, exist_ok=True)
 FIG_DIR.mkdir(parents=True, exist_ok=True)
 
+
+# ============================================================
+# CONFIG
+# ============================================================
+
 # Use spatial_block as the main decision criterion because it is harder
 # and closer to realistic clustered missingness.
 PRIMARY_HOLDOUT = "spatial_block"
 
-# FFNN was unstable/weak in validation, so exclude it from first recommended set.
+# FFNN was unstable/weak in validation, so exclude from recommendations.
 EXCLUDE_MODELS_FROM_RECOMMENDATION = {"ffnn_mlp", "baseline", "baseline_train_mean"}
 
 # How many ML models to keep for script 11 candidate predictions.
 N_ML_MODELS_TO_RECOMMEND = 3
 
-# Keep the two interpolation methods: centroid OK + nearest neighbor baseline.
+# Keep the two interpolation methods: centroid OK + nearest neighbour.
 N_INTERP_METHODS_TO_RECOMMEND = 2
 
 
@@ -87,17 +105,8 @@ def read_ml_metrics(path: Path) -> pd.DataFrame:
     df = pd.read_csv(path)
 
     required = {
-        "split",
-        "holdout_mode",
-        "feature_group",
-        "model",
-        "n_features",
-        "features",
-        "rmse",
-        "mae",
-        "bias",
-        "r2",
-        "n",
+        "split", "holdout_mode", "feature_group", "model",
+        "n_features", "features", "rmse", "mae", "bias", "r2", "n",
     }
     missing = sorted(required - set(df.columns))
     if missing:
@@ -106,9 +115,7 @@ def read_ml_metrics(path: Path) -> pd.DataFrame:
     out = df.copy()
     out["method_family"] = "ML"
     out["method"] = out["model"].astype(str)
-    out["method_name"] = (
-        out["model"].astype(str) + " | " + out["feature_group"].astype(str)
-    )
+    out["method_name"] = out["model"].astype(str) + " | " + out["feature_group"].astype(str)
     out["source_file"] = str(path)
     return out
 
@@ -117,16 +124,7 @@ def read_interpolation_metrics(path: Path) -> pd.DataFrame:
     require_file(path)
     df = pd.read_csv(path)
 
-    required = {
-        "split",
-        "holdout_mode",
-        "method",
-        "rmse",
-        "mae",
-        "bias",
-        "r2",
-        "n",
-    }
+    required = {"split", "holdout_mode", "method", "rmse", "mae", "bias", "r2", "n"}
     missing = sorted(required - set(df.columns))
     if missing:
         raise ValueError(f"Interpolation metrics missing required columns: {missing}")
@@ -139,41 +137,24 @@ def read_interpolation_metrics(path: Path) -> pd.DataFrame:
     out["features"] = out.get("features", pd.Series([""] * len(out)))
     out["method_name"] = out["method"].astype(str)
     out["source_file"] = str(path)
-
     return out
 
 
 def standardize_columns(df: pd.DataFrame) -> pd.DataFrame:
     cols = [
-        "split",
-        "holdout_mode",
-        "method_family",
-        "method",
-        "method_name",
-        "feature_group",
-        "model",
-        "n_features",
-        "features",
-        "rmse",
-        "mae",
-        "bias",
-        "r2",
-        "n",
-        "source_file",
+        "split", "holdout_mode", "method_family", "method", "method_name",
+        "feature_group", "model", "n_features", "features",
+        "rmse", "mae", "bias", "r2", "n", "source_file",
     ]
-
     for c in cols:
         if c not in df.columns:
             df[c] = pd.NA
 
     out = df[cols].copy()
-
-    numeric_cols = ["n_features", "rmse", "mae", "bias", "r2", "n"]
-    for c in numeric_cols:
+    for c in ["n_features", "rmse", "mae", "bias", "r2", "n"]:
         out[c] = pd.to_numeric(out[c], errors="coerce")
 
-    out = out.sort_values(["holdout_mode", "rmse", "mae"]).reset_index(drop=True)
-    return out
+    return out.sort_values(["holdout_mode", "rmse", "mae"]).reset_index(drop=True)
 
 
 def add_ranks(df: pd.DataFrame) -> pd.DataFrame:
@@ -194,9 +175,7 @@ def add_ranks(df: pd.DataFrame) -> pd.DataFrame:
 def make_best_by_holdout(df: pd.DataFrame) -> pd.DataFrame:
     rows = []
     for holdout, sub in df.groupby("holdout_mode"):
-        sub = sub.sort_values(["rmse", "mae"]).copy()
-        rows.append(sub.head(1))
-
+        rows.append(sub.sort_values(["rmse", "mae"]).head(1))
     return pd.concat(rows, ignore_index=True)
 
 
@@ -207,10 +186,8 @@ def make_recommendations(df: pd.DataFrame) -> pd.DataFrame:
 
     recommendations = []
 
-    # 1. Interpolation recommendations
-    interp = primary[primary["method_family"].eq("Interpolation")].copy()
-    interp = interp.sort_values(["rmse", "mae"])
-
+    # Interpolation
+    interp = primary[primary["method_family"].eq("Interpolation")].sort_values(["rmse", "mae"])
     if not interp.empty:
         keep = interp.head(N_INTERP_METHODS_TO_RECOMMEND).copy()
         keep["recommendation_role"] = [
@@ -219,15 +196,13 @@ def make_recommendations(df: pd.DataFrame) -> pd.DataFrame:
         ]
         recommendations.append(keep)
 
-    # 2. ML recommendations: choose best feature group per model first
+    # ML: best feature group per model first
     ml = primary[primary["method_family"].eq("ML")].copy()
     ml = ml[~ml["model"].isin(EXCLUDE_MODELS_FROM_RECOMMENDATION)]
     ml = ml.sort_values(["model", "rmse", "mae"])
-    ml_best_per_model = ml.groupby("model", as_index=False).head(1)
-    ml_best_per_model = ml_best_per_model.sort_values(["rmse", "mae"])
-
-    if not ml_best_per_model.empty:
-        keep = ml_best_per_model.head(N_ML_MODELS_TO_RECOMMEND).copy()
+    ml_best = ml.groupby("model", as_index=False).head(1).sort_values(["rmse", "mae"])
+    if not ml_best.empty:
+        keep = ml_best.head(N_ML_MODELS_TO_RECOMMEND).copy()
         keep["recommendation_role"] = "ml_auxiliary_baseline"
         recommendations.append(keep)
 
@@ -235,10 +210,7 @@ def make_recommendations(df: pd.DataFrame) -> pd.DataFrame:
         return pd.DataFrame()
 
     out = pd.concat(recommendations, ignore_index=True)
-    out = out.sort_values(
-        ["recommendation_role", "rmse", "mae"]
-    ).reset_index(drop=True)
-
+    out = out.sort_values(["recommendation_role", "rmse", "mae"]).reset_index(drop=True)
     out["use_in_script_11"] = True
     return out
 
@@ -249,82 +221,46 @@ def write_report(
     recs: pd.DataFrame,
     path: Path,
 ) -> None:
-    lines = []
+    lines = [
+        "SMAP Gap-Filling Validation Comparison",
+        "=" * 45,
+        "",
+        f"Primary decision holdout: {PRIMARY_HOLDOUT}",
+        "",
+        "Interpretation rule:",
+        "  Lower RMSE/MAE is better. Spatial-block validation should be treated",
+        "  as more important than random-cell validation because it is harder",
+        "  and more realistic for clustered missingness.",
+        "",
+        "Best method by holdout mode:",
+        "-" * 45,
+    ]
 
-    lines.append("SMAP Gap-Filling Validation Comparison")
-    lines.append("=" * 45)
-    lines.append("")
-    lines.append(f"Primary decision holdout: {PRIMARY_HOLDOUT}")
-    lines.append("")
-    lines.append("Interpretation rule:")
-    lines.append(
-        "  Lower RMSE/MAE is better. Spatial-block validation should be treated "
-        "as more important than random-cell validation because it is harder and "
-        "more realistic for clustered missingness."
-    )
-    lines.append("")
-
-    lines.append("Best method by holdout mode:")
-    lines.append("-" * 45)
     if not best.empty:
         lines.append(
-            best[
-                [
-                    "holdout_mode",
-                    "method_family",
-                    "method_name",
-                    "rmse",
-                    "mae",
-                    "bias",
-                    "r2",
-                    "n",
-                ]
-            ].to_string(index=False)
+            best[["holdout_mode", "method_family", "method_name",
+                  "rmse", "mae", "bias", "r2", "n"]].to_string(index=False)
         )
-    lines.append("")
 
-    lines.append("Recommended base models for next stage:")
-    lines.append("-" * 45)
+    lines += ["", "Recommended base models for next stage:", "-" * 45]
+
     if not recs.empty:
         lines.append(
-            recs[
-                [
-                    "recommendation_role",
-                    "method_family",
-                    "method_name",
-                    "rmse",
-                    "mae",
-                    "bias",
-                    "r2",
-                    "n",
-                ]
-            ].to_string(index=False)
+            recs[["recommendation_role", "method_family", "method_name",
+                  "rmse", "mae", "bias", "r2", "n"]].to_string(index=False)
         )
     else:
         lines.append("No recommendations generated.")
-    lines.append("")
 
-    lines.append("Top 15 methods under spatial-block validation:")
-    lines.append("-" * 45)
+    lines += ["", "Top 15 methods under spatial-block validation:", "-" * 45]
     spatial = combined[combined["holdout_mode"].eq("spatial_block")]
     if not spatial.empty:
         lines.append(
             spatial.sort_values(["rmse", "mae"])
-            [
-                [
-                    "method_family",
-                    "method_name",
-                    "rmse",
-                    "mae",
-                    "bias",
-                    "r2",
-                    "n",
-                ]
-            ]
+            [["method_family", "method_name", "rmse", "mae", "bias", "r2", "n"]]
             .head(15)
             .to_string(index=False)
         )
-    lines.append("")
 
     path.write_text("\n".join(lines))
 
@@ -342,7 +278,6 @@ def plot_rmse(df: pd.DataFrame, holdout_mode: str, path: Path, top_n: int = 20) 
     plt.figure(figsize=(10, height))
     plt.barh(labels[::-1], rmse[::-1])
     plt.xlabel("RMSE")
-    plt.ylabel("")
     plt.title(f"Top {len(sub)} methods by RMSE: {holdout_mode}")
     plt.tight_layout()
     plt.savefig(path)
@@ -356,6 +291,7 @@ def plot_rmse(df: pd.DataFrame, holdout_mode: str, path: Path, top_n: int = 20) 
 def main() -> None:
     print("Comparing SMAP gap-filling validation results")
     print("=" * 70)
+    print(f"Project root:          {cfg.PROJECT_ROOT}")
     print(f"ML metrics:            {ML_METRICS_PATH}")
     print(f"Interpolation metrics: {INTERP_METRICS_PATH}")
     print(f"Output folder:         {OUT_DIR}")
@@ -379,7 +315,6 @@ def main() -> None:
     combined.to_csv(combined_path, index=False)
     best.to_csv(best_path, index=False)
     recs.to_csv(recs_path, index=False)
-
     write_report(combined, best, recs, report_path)
 
     for holdout in sorted(combined["holdout_mode"].dropna().unique()):
@@ -400,18 +335,8 @@ def main() -> None:
     print("\nRecommended base models:")
     if not recs.empty:
         print(
-            recs[
-                [
-                    "recommendation_role",
-                    "method_family",
-                    "method_name",
-                    "rmse",
-                    "mae",
-                    "bias",
-                    "r2",
-                    "n",
-                ]
-            ].to_string(index=False)
+            recs[["recommendation_role", "method_family", "method_name",
+                  "rmse", "mae", "bias", "r2", "n"]].to_string(index=False)
         )
     else:
         print("No recommendations generated.")

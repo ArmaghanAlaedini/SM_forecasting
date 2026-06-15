@@ -10,6 +10,7 @@ Edit this file to control:
   - which final filling method is primary
   - which fallback methods are allowed
   - which years are gap-filled
+  - stacking meta-model path
 
 Used by:
   11a_generate_ml_gapfill_predictions.py
@@ -40,6 +41,15 @@ FINAL_DIR = (
     / "src/data/processed/smap_gap_filling/08_gapfilled_final"
 )
 
+# Path to the stacking meta-model saved by 10g.
+# 11c will load this and use it to combine base predictions.
+# Set to None to fall back to the waterfall rule (no stacking).
+META_MODEL_PATH = (
+    PROJECT_ROOT
+    / "src/data/processed/smap_gap_filling"
+    / "05_gapfill_model_validation/stacking/meta_model.joblib"
+)
+
 
 # ============================================================
 # BASIC COLUMNS
@@ -51,15 +61,16 @@ PASSES = ["am", "pm"]
 
 
 # ============================================================
-# YEARS
+# YEARS  ← FIXED: 2024 and 2025 excluded from ML training
 # ============================================================
 
-# Production gap filling:
-# Use all observed rows from 2020-2025 to train ML, then fill real gaps.
-# This is for creating the retrospective completed dataset.
-ML_TRAIN_YEARS = [2020, 2021, 2022, 2023, 2024, 2025]
+# Models must be trained ONLY on 2020-2023.
+# 2024 = validation year (used in 10a/10b/10c to pick methods).
+# 2025 = test year (never touched during model selection).
+ML_TRAIN_YEARS = [2020, 2021, 2022, 2023]
 
 # Years whose real missing pixels should be filled.
+# All years are filled, but the models were trained only on 2020-2023.
 GAPFILL_YEARS = [2020, 2021, 2022, 2023, 2024, 2025]
 
 
@@ -80,14 +91,6 @@ ML_MODELS_TO_USE = [
 
 ML_FEATURE_GROUP_NAME = "available_all_iem_spatiotemporal"
 
-# Currently available feature subset.
-# The missing columns are not included:
-#   soil112tn_pta
-#   soil112t_pta
-#   soil112tx_pta
-#   soil112wc_pta
-#   soil24wc_pta
-#   soil50wc_pta
 ML_FEATURES_TO_USE = [
     "precip_pta",
     "rh_pta",
@@ -120,7 +123,7 @@ STRICT_ML_FEATURES = False
 # ============================================================
 
 # Use None on HPC if you want all training rows.
-# Use 250_000 or 500_000 on laptop if needed.
+# Use 250_000 on laptop if memory is tight.
 MAX_ML_TRAIN_ROWS = 250_000
 
 RANDOM_STATE = 42
@@ -140,8 +143,13 @@ INTERPOLATION_METHODS_TO_USE = [
 # FINAL FILLING RULE
 # ============================================================
 
+# Primary method fed into the stacking meta-model.
+# Also used as the first waterfall fallback if stacking is disabled.
 FINAL_PRIMARY_METHOD = "centroid_ordinary_kriging"
 
+# Waterfall order used ONLY when:
+#   (a) META_MODEL_PATH is None, OR
+#   (b) the meta-model itself returns NaN for a pixel
 FINAL_FALLBACK_METHODS = [
     "nearest_neighbor_same_day",
     "xgboost",

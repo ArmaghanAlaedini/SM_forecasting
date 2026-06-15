@@ -1,5 +1,4 @@
 #!/usr/bin/env Rscript
-
 # 11b_generate_interpolation_gapfill_predictions.R
 #
 # Predict REAL original missing SMAP pixels using same-day observed SMAP pixels.
@@ -20,10 +19,60 @@ suppressPackageStartupMessages({
 
 
 # ============================================================
-# MANUAL SETTINGS
+# PROJECT ROOT  ← FIXED: uses env var, not getwd()
 # ============================================================
 
-PROJECT_ROOT <- normalizePath(getwd(), mustWork = TRUE)
+find_project_root <- function() {
+  env_root <- Sys.getenv("SMAP_PROJECT_ROOT", unset = "")
+  if (nzchar(env_root)) {
+    return(normalizePath(env_root, mustWork = TRUE))
+  }
+
+  # Walk up from script location
+  script_path <- tryCatch(
+    normalizePath(sys.frame(1)$ofile, mustWork = FALSE),
+    error = function(e) ""
+  )
+
+  if (nzchar(script_path)) {
+    p <- dirname(script_path)
+    for (i in 1:6) {
+      if (dir.exists(file.path(p, "src")) &&
+          (file.exists(file.path(p, ".git")) ||
+           dir.exists(file.path(p, "renv")) ||
+           file.exists(file.path(p, "environment.yml")))) {
+        return(normalizePath(p, mustWork = TRUE))
+      }
+      p <- dirname(p)
+    }
+  }
+
+  # Last resort: walk up from working directory
+  p <- normalizePath(getwd(), mustWork = TRUE)
+  for (i in 1:6) {
+    if (dir.exists(file.path(p, "src")) &&
+        (file.exists(file.path(p, ".git")) ||
+         dir.exists(file.path(p, "renv")) ||
+         file.exists(file.path(p, "environment.yml")))) {
+      return(normalizePath(p, mustWork = TRUE))
+    }
+    p <- dirname(p)
+  }
+
+  stop(
+    "Could not find project root.\n",
+    "Set SMAP_PROJECT_ROOT env var or run from inside the project folder.\n",
+    "Example:  export SMAP_PROJECT_ROOT=/work/estherjo/alaedini/projects/iem_pta_kriging"
+  )
+}
+
+PROJECT_ROOT <- find_project_root()
+message("Project root: ", PROJECT_ROOT)
+
+
+# ============================================================
+# MANUAL SETTINGS
+# ============================================================
 
 INPUT_DIR <- file.path(
   PROJECT_ROOT,
@@ -38,9 +87,9 @@ OUT_DIR <- file.path(
 dir.create(OUT_DIR, recursive = TRUE, showWarnings = FALSE)
 
 TARGET <- "soil_moisture"
-KEY <- "smap_pixel_key"
+KEY    <- "smap_pixel_key"
 
-PASSES <- c("am", "pm")
+PASSES        <- c("am", "pm")
 GAPFILL_YEARS <- c(2020, 2021, 2022, 2023, 2024, 2025)
 
 METHODS_TO_USE <- c(
@@ -49,9 +98,9 @@ METHODS_TO_USE <- c(
 )
 
 MIN_OBSERVED_ROWS_PER_FILE <- 30L
-NN_CHUNK_SIZE <- 500L
+NN_CHUNK_SIZE              <- 500L
 
-PRED_PATH <- file.path(OUT_DIR, "interpolation_gapfill_predictions.csv")
+PRED_PATH     <- file.path(OUT_DIR, "interpolation_gapfill_predictions.csv")
 MANIFEST_PATH <- file.path(OUT_DIR, "interpolation_gapfill_manifest.csv")
 
 
@@ -61,38 +110,25 @@ MANIFEST_PATH <- file.path(OUT_DIR, "interpolation_gapfill_manifest.csv")
 
 parse_date_from_filename <- function(path) {
   base <- basename(path)
-  m <- regmatches(base, regexpr("[0-9]{8}", base))
-
-  if (length(m) == 0 || m == "") {
-    stop("Could not parse YYYYMMDD from filename: ", path)
-  }
-
+  m    <- regmatches(base, regexpr("[0-9]{8}", base))
+  if (length(m) == 0 || m == "") stop("Could not parse YYYYMMDD from: ", path)
   as.IDate(m, format = "%Y%m%d")
 }
-
 
 file_id_from_path <- function(pass_name, path) {
   paste0(pass_name, "/", basename(path))
 }
 
-
 list_complete_files <- function() {
   out <- list()
-
   for (pass_name in PASSES) {
     d <- file.path(INPUT_DIR, pass_name, "complete")
-
-    if (!dir.exists(d)) {
-      stop("Missing input folder: ", d)
-    }
-
+    if (!dir.exists(d)) stop("Missing input folder: ", d)
     files <- sort(list.files(d, pattern = "\\.csv$", full.names = TRUE))
     out[[pass_name]] <- files
   }
-
   out
 }
-
 
 add_basic_columns <- function(dt, pass_name, path) {
   setDT(dt)
@@ -104,11 +140,11 @@ add_basic_columns <- function(dt, pass_name, path) {
     dt[, date := parse_date_from_filename(path)]
   }
 
-  dt[, year := as.integer(format(date, "%Y"))]
-  dt[, month := as.integer(format(date, "%m"))]
+  dt[, year        := as.integer(format(date, "%Y"))]
+  dt[, month       := as.integer(format(date, "%m"))]
   dt[, day_of_year := as.integer(format(date, "%j"))]
-  dt[, pass := pass_name]
-  dt[, file_id := file_id_from_path(pass_name, path)]
+  dt[, pass        := pass_name]
+  dt[, file_id     := file_id_from_path(pass_name, path)]
 
   if (!(KEY %in% names(dt))) {
     if (all(c("grid_row", "grid_col") %in% names(dt))) {
@@ -117,247 +153,190 @@ add_basic_columns <- function(dt, pass_name, path) {
       dt[, (KEY) := as.character(seq_len(.N))]
     }
   }
-
   dt[, (KEY) := as.character(get(KEY))]
   dt
 }
 
 
-read_one_file <- function(path, pass_name) {
-  dt <- fread(path)
-  add_basic_columns(dt, pass_name, path)
+# ============================================================
+# NEAREST NEIGHBOUR (vectorised)
+# ============================================================
+
+predict_nearest_neighbor <- function(observed_dt, missing_dt) {
+  if (nrow(observed_dt) == 0 || nrow(missing_dt) == 0) {
+    return(data.table(
+      smap_pixel_key   = missing_dt[[KEY]],
+      method           = "nearest_neighbor_same_day",
+      prediction       = NA_real_,
+      nearest_distance = NA_real_
+    ))
+  }
+
+  obs_x <- as.numeric(observed_dt[["x"]])
+  obs_y <- as.numeric(observed_dt[["y"]])
+  mis_x <- as.numeric(missing_dt[["x"]])
+  mis_y <- as.numeric(missing_dt[["y"]])
+
+  n_chunks <- ceiling(nrow(missing_dt) / NN_CHUNK_SIZE)
+  preds    <- numeric(nrow(missing_dt))
+  dists    <- numeric(nrow(missing_dt))
+
+  for (chunk in seq_len(n_chunks)) {
+    idx_start <- (chunk - 1L) * NN_CHUNK_SIZE + 1L
+    idx_end   <- min(chunk * NN_CHUNK_SIZE, nrow(missing_dt))
+    cx        <- mis_x[idx_start:idx_end]
+    cy        <- mis_y[idx_start:idx_end]
+
+    dx  <- outer(cx, obs_x, "-")
+    dy  <- outer(cy, obs_y, "-")
+    d2  <- dx^2 + dy^2
+    idx <- max.col(-d2, ties.method = "first")
+
+    preds[idx_start:idx_end] <- as.numeric(observed_dt[[TARGET]])[idx]
+    dists[idx_start:idx_end] <- sqrt(d2[cbind(seq_along(cx), idx)])
+  }
+
+  data.table(
+    smap_pixel_key   = missing_dt[[KEY]],
+    method           = "nearest_neighbor_same_day",
+    prediction       = preds,
+    nearest_distance = dists
+  )
 }
 
 
-as_num <- function(x) {
-  suppressWarnings(as.numeric(x))
-}
+# ============================================================
+# CENTROID ORDINARY KRIGING
+# ============================================================
 
-
-get_coord_cols <- function(dt) {
-  if (all(c("x", "y") %in% names(dt))) {
-    return(c("x", "y"))
-  }
-
-  if (all(c("lon", "lat") %in% names(dt))) {
-    return(c("lon", "lat"))
-  }
-
-  stop("No coordinate columns found. Need either x/y or lon/lat.")
-}
-
-
-nearest_neighbor_predict <- function(obs, target, coord_cols) {
-  ox <- as.matrix(obs[, ..coord_cols])
-  tx <- as.matrix(target[, ..coord_cols])
-  oy <- as_num(obs[[TARGET]])
-
-  ox <- apply(ox, 2, as_num)
-  tx <- apply(tx, 2, as_num)
-
-  if (!is.matrix(ox)) {
-    ox <- matrix(ox, ncol = length(coord_cols))
-  }
-
-  if (!is.matrix(tx)) {
-    tx <- matrix(tx, ncol = length(coord_cols))
-  }
-
-  n_target <- nrow(tx)
-  pred <- rep(NA_real_, n_target)
-  dist_out <- rep(NA_real_, n_target)
-
-  valid_obs <- is.finite(oy) & complete.cases(ox)
-  ox <- ox[valid_obs, , drop = FALSE]
-  oy <- oy[valid_obs]
-
-  if (length(oy) == 0 || nrow(ox) == 0) {
-    return(data.table(prediction = pred, nearest_distance = dist_out))
-  }
-
-  for (start in seq(1L, n_target, by = NN_CHUNK_SIZE)) {
-    end <- min(start + NN_CHUNK_SIZE - 1L, n_target)
-    idx <- start:end
-
-    block <- tx[idx, , drop = FALSE]
-    valid_target <- complete.cases(block)
-
-    if (!any(valid_target)) {
-      next
-    }
-
-    block_valid <- block[valid_target, , drop = FALSE]
-
-    block_sq <- rowSums(block_valid^2)
-    obs_sq <- rowSums(ox^2)
-
-    d2 <- outer(block_sq, obs_sq, "+") - 2 * tcrossprod(block_valid, ox)
-    d2[d2 < 0] <- 0
-
-    nn <- max.col(-d2, ties.method = "first")
-    local_rows <- idx[valid_target]
-
-    pred[local_rows] <- oy[nn]
-    dist_out[local_rows] <- sqrt(d2[cbind(seq_along(nn), nn)])
-  }
-
-  data.table(prediction = pred, nearest_distance = dist_out)
-}
-
-
-ordinary_kriging_predict <- function(obs, target, coord_cols) {
-  out <- data.table(
-    prediction = rep(NA_real_, nrow(target)),
-    kriging_variance = rep(NA_real_, nrow(target)),
-    ok_fallback = rep(FALSE, nrow(target))
+predict_centroid_ok <- function(observed_dt, missing_dt) {
+  empty_result <- data.table(
+    smap_pixel_key  = missing_dt[[KEY]],
+    method          = "centroid_ordinary_kriging",
+    prediction      = NA_real_,
+    kriging_variance = NA_real_
   )
 
-  obs <- copy(obs)
-  target <- copy(target)
+  if (nrow(observed_dt) < 5L || nrow(missing_dt) == 0L) return(empty_result)
 
-  obs[, (TARGET) := as_num(get(TARGET))]
+  obs_x <- as.numeric(observed_dt[["x"]])
+  obs_y <- as.numeric(observed_dt[["y"]])
+  obs_z <- as.numeric(observed_dt[[TARGET]])
 
-  for (cc in coord_cols) {
-    obs[, (cc) := as_num(get(cc))]
-    target[, (cc) := as_num(get(cc))]
-  }
+  valid <- is.finite(obs_x) & is.finite(obs_y) & is.finite(obs_z)
+  if (sum(valid) < 5L) return(empty_result)
 
-  obs <- obs[is.finite(get(TARGET))]
-  obs <- obs[complete.cases(obs[, ..coord_cols])]
+  obs_x <- obs_x[valid]
+  obs_y <- obs_y[valid]
+  obs_z <- obs_z[valid]
 
-  target_valid <- complete.cases(target[, ..coord_cols])
-
-  if (nrow(obs) < MIN_OBSERVED_ROWS_PER_FILE || !any(target_valid)) {
-    nn <- nearest_neighbor_predict(obs, target, coord_cols)
-    out[, prediction := nn$prediction]
-    out[, ok_fallback := TRUE]
-    return(out)
-  }
+  mis_x <- as.numeric(missing_dt[["x"]])
+  mis_y <- as.numeric(missing_dt[["y"]])
 
   result <- tryCatch({
-    obs_sp <- as.data.frame(obs)
-    target_sp <- as.data.frame(target[target_valid])
+    obs_sp <- SpatialPointsDataFrame(
+      coords = cbind(obs_x, obs_y),
+      data   = data.frame(z = obs_z)
+    )
+    mis_sp <- SpatialPoints(cbind(mis_x, mis_y))
 
-    sp::coordinates(obs_sp) <- stats::as.formula(
-      paste("~", paste(coord_cols, collapse = "+"))
+    vfit <- tryCatch(
+      fit.variogram(
+        variogram(z ~ 1, obs_sp),
+        vgm(c("Sph", "Exp", "Gau"))
+      ),
+      error = function(e) NULL
     )
 
-    sp::coordinates(target_sp) <- stats::as.formula(
-      paste("~", paste(coord_cols, collapse = "+"))
-    )
+    if (is.null(vfit)) return(empty_result)
 
-    vals <- obs[[TARGET]]
-    v <- stats::var(vals, na.rm = TRUE)
+    kg <- krige(z ~ 1, obs_sp, mis_sp, model = vfit, debug.level = 0)
 
-    if (!is.finite(v) || v <= 0) {
-      stop("Non-positive variance in observed values.")
-    }
-
-    xr <- range(obs[[coord_cols[1]]], na.rm = TRUE)
-    yr <- range(obs[[coord_cols[2]]], na.rm = TRUE)
-    diag_range <- sqrt(diff(xr)^2 + diff(yr)^2)
-
-    if (!is.finite(diag_range) || diag_range <= 0) {
-      diag_range <- 1
-    }
-
-    init_model <- gstat::vgm(
-      psill = 0.8 * v,
-      model = "Exp",
-      range = diag_range / 3,
-      nugget = 0.2 * v
-    )
-
-    emp <- suppressWarnings(
-      gstat::variogram(
-        stats::as.formula(paste(TARGET, "~ 1")),
-        obs_sp
-      )
-    )
-
-    fit <- tryCatch(
-      suppressWarnings(gstat::fit.variogram(emp, init_model)),
-      error = function(e) init_model,
-      warning = function(w) init_model
-    )
-
-    kr <- suppressWarnings(
-      gstat::krige(
-        stats::as.formula(paste(TARGET, "~ 1")),
-        obs_sp,
-        target_sp,
-        model = fit,
-        debug.level = 0
-      )
-    )
-
-    list(
-      ok = TRUE,
-      target_rows = which(target_valid),
-      pred = as_num(kr$var1.pred),
-      var = as_num(kr$var1.var)
+    data.table(
+      smap_pixel_key   = missing_dt[[KEY]],
+      method           = "centroid_ordinary_kriging",
+      prediction       = as.numeric(kg$var1.pred),
+      kriging_variance = as.numeric(kg$var1.var)
     )
   }, error = function(e) {
-    list(ok = FALSE, error = conditionMessage(e))
+    message("  Kriging failed: ", conditionMessage(e))
+    empty_result
   })
 
-  if (isTRUE(result$ok)) {
-    out[result$target_rows, prediction := result$pred]
-    out[result$target_rows, kriging_variance := result$var]
-    return(out)
-  }
-
-  nn <- nearest_neighbor_predict(obs, target, coord_cols)
-  out[, prediction := nn$prediction]
-  out[, ok_fallback := TRUE]
-  out
+  result
 }
 
 
-initialize_prediction_file <- function() {
-  if (file.exists(PRED_PATH)) {
-    file.remove(PRED_PATH)
-  }
+# ============================================================
+# PROCESS ONE FILE
+# ============================================================
 
-  header <- data.table(
-    file_id = character(),
-    date = character(),
-    year = integer(),
-    pass = character(),
-    smap_pixel_key = character(),
-    method = character(),
-    prediction = numeric(),
-    nearest_distance = numeric(),
-    kriging_variance = numeric(),
-    ok_fallback = logical(),
-    source_file = character()
+process_one_file <- function(pass_name, path) {
+  date <- parse_date_from_filename(path)
+  year <- as.integer(format(date, "%Y"))
+
+  if (!(year %in% GAPFILL_YEARS)) return(NULL)
+
+  dt <- tryCatch(fread(path, showProgress = FALSE), error = function(e) NULL)
+  if (is.null(dt) || nrow(dt) == 0) return(NULL)
+
+  dt <- add_basic_columns(dt, pass_name, path)
+  dt[, (TARGET) := suppressWarnings(as.numeric(get(TARGET)))]
+
+  fid      <- file_id_from_path(pass_name, path)
+  observed <- dt[!is.na(get(TARGET))]
+  missing  <- dt[is.na(get(TARGET))]
+
+  manifest_row <- list(
+    file_id            = fid,
+    date               = as.character(date),
+    year               = year,
+    pass               = pass_name,
+    source_file        = path,
+    n_rows             = nrow(dt),
+    n_observed         = nrow(observed),
+    n_missing          = nrow(missing),
+    methods_run        = paste(METHODS_TO_USE, collapse = ";"),
+    status             = "ok",
+    message            = ""
   )
 
-  fwrite(header, PRED_PATH)
-}
-
-
-append_predictions <- function(dt) {
-  out_cols <- c(
-    "file_id",
-    "date",
-    "year",
-    "pass",
-    "smap_pixel_key",
-    "method",
-    "prediction",
-    "nearest_distance",
-    "kriging_variance",
-    "ok_fallback",
-    "source_file"
-  )
-
-  missing_cols <- setdiff(out_cols, names(dt))
-  for (cc in missing_cols) {
-    dt[, (cc) := NA]
+  if (nrow(missing) == 0) {
+    return(list(preds = NULL, manifest = manifest_row))
   }
 
-  fwrite(dt[, ..out_cols], PRED_PATH, append = TRUE)
+  if (nrow(observed) < MIN_OBSERVED_ROWS_PER_FILE) {
+    manifest_row$status  <- "skipped_too_few_observed"
+    manifest_row$message <- paste("Only", nrow(observed), "observed rows")
+    return(list(preds = NULL, manifest = manifest_row))
+  }
+
+  parts <- list()
+
+  if ("nearest_neighbor_same_day" %in% METHODS_TO_USE) {
+    nn <- predict_nearest_neighbor(observed, missing)
+    nn[, file_id    := fid]
+    nn[, date       := as.character(date)]
+    nn[, year       := year]
+    nn[, pass       := pass_name]
+    nn[, (KEY)      := missing[[KEY]]]
+    parts[["nn"]] <- nn
+  }
+
+  if ("centroid_ordinary_kriging" %in% METHODS_TO_USE) {
+    ok <- predict_centroid_ok(observed, missing)
+    ok[, file_id := fid]
+    ok[, date    := as.character(date)]
+    ok[, year    := year]
+    ok[, pass    := pass_name]
+    ok[, (KEY)   := missing[[KEY]]]
+    parts[["ok"]] <- ok
+  }
+
+  if (length(parts) == 0) return(list(preds = NULL, manifest = manifest_row))
+
+  preds <- rbindlist(parts, fill = TRUE)
+  list(preds = preds, manifest = manifest_row)
 }
 
 
@@ -366,156 +345,84 @@ append_predictions <- function(dt) {
 # ============================================================
 
 main <- function() {
-  message("11b: Generate interpolation predictions for real SMAP gaps")
-  message(strrep("=", 80))
-  message("Project root:  ", PROJECT_ROOT)
-  message("Input folder:  ", INPUT_DIR)
-  message("Output folder: ", OUT_DIR)
-  message("Methods:       ", paste(METHODS_TO_USE, collapse = ", "))
-  message("Gapfill years: ", paste(GAPFILL_YEARS, collapse = ", "))
-  message(strrep("=", 80))
+  message("11b: Generate interpolation gap-fill predictions")
+  message(strrep("=", 70))
+  message("Project root: ", PROJECT_ROOT)
+  message("Input dir:    ", INPUT_DIR)
+  message("Output dir:   ", OUT_DIR)
+  message("Methods:      ", paste(METHODS_TO_USE, collapse = ", "))
+  message("Years:        ", paste(GAPFILL_YEARS, collapse = ", "))
+  message(strrep("=", 70))
 
-  files_by_pass <- list_complete_files()
-  initialize_prediction_file()
+  all_files <- list_complete_files()
 
-  manifest_parts <- list()
+  # Write output header
+  header <- data.table(
+    file_id          = character(),
+    date             = character(),
+    year             = integer(),
+    pass             = character(),
+    smap_pixel_key   = character(),
+    method           = character(),
+    prediction       = numeric(),
+    kriging_variance = numeric(),
+    nearest_distance = numeric()
+  )
+  fwrite(header, PRED_PATH)
 
-  total_files <- sum(lengths(files_by_pass))
-  scanned <- 0L
-  total_missing <- 0L
-  total_prediction_rows <- 0L
+  manifest_rows <- list()
+  total_files   <- sum(lengths(all_files))
+  counter       <- 0L
 
-  for (pass_name in names(files_by_pass)) {
-    files <- files_by_pass[[pass_name]]
+  for (pass_name in PASSES) {
+    files <- all_files[[pass_name]]
+    message("\nProcessing ", toupper(pass_name), " files: ", length(files))
 
     for (path in files) {
-      scanned <- scanned + 1L
-
-      date <- parse_date_from_filename(path)
-      year <- as.integer(format(date, "%Y"))
-
-      if (!(year %in% GAPFILL_YEARS)) {
-        next
-      }
-
-      dt <- read_one_file(path, pass_name)
-
-      if (!(TARGET %in% names(dt))) {
-        warning("Skipping file without target column: ", path)
-        next
-      }
-
-      coord_cols <- get_coord_cols(dt)
-
-      for (cc in coord_cols) {
-        dt[, (cc) := as_num(get(cc))]
-      }
-
-      dt[, (TARGET) := as_num(get(TARGET))]
-
-      observed <- dt[is.finite(get(TARGET))]
-      missing <- dt[!is.finite(get(TARGET))]
-
-      n_obs <- nrow(observed)
-      n_miss <- nrow(missing)
-
-      if (n_miss == 0) {
-        manifest_parts[[length(manifest_parts) + 1L]] <- data.table(
-          file_id = file_id_from_path(pass_name, path),
-          date = as.character(date),
-          year = year,
-          pass = pass_name,
-          source_file = path,
-          n_rows = nrow(dt),
-          n_observed = n_obs,
-          n_missing_target = 0L,
-          n_methods = length(METHODS_TO_USE),
-          n_prediction_rows = 0L
-        )
-        next
-      }
-
-      if (n_obs < MIN_OBSERVED_ROWS_PER_FILE) {
-        warning("Skipping interpolation for file with too few observed rows: ", path)
-        next
-      }
-
-      base_cols <- data.table(
-        file_id = missing$file_id,
-        date = as.character(missing$date),
-        year = missing$year,
-        pass = missing$pass,
-        smap_pixel_key = missing[[KEY]],
-        source_file = path
+      counter <- counter + 1L
+      result  <- tryCatch(
+        process_one_file(pass_name, path),
+        error = function(e) {
+          message("  FAILED: ", basename(path), " | ", conditionMessage(e))
+          list(
+            preds    = NULL,
+            manifest = list(
+              file_id     = file_id_from_path(pass_name, path),
+              date        = NA_character_,
+              year        = NA_integer_,
+              pass        = pass_name,
+              source_file = path,
+              n_rows      = NA_integer_,
+              n_observed  = NA_integer_,
+              n_missing   = NA_integer_,
+              methods_run = paste(METHODS_TO_USE, collapse = ";"),
+              status      = "failed",
+              message     = conditionMessage(e)
+            )
+          )
+        }
       )
 
-      if ("nearest_neighbor_same_day" %in% METHODS_TO_USE) {
-        nn <- nearest_neighbor_predict(observed, missing, coord_cols)
-
-        nn_out <- copy(base_cols)
-        nn_out[, method := "nearest_neighbor_same_day"]
-        nn_out[, prediction := nn$prediction]
-        nn_out[, nearest_distance := nn$nearest_distance]
-        nn_out[, kriging_variance := NA_real_]
-        nn_out[, ok_fallback := FALSE]
-
-        append_predictions(nn_out)
-        total_prediction_rows <- total_prediction_rows + nrow(nn_out)
+      if (!is.null(result$preds) && nrow(result$preds) > 0) {
+        fwrite(result$preds, PRED_PATH, append = TRUE)
       }
 
-      if ("centroid_ordinary_kriging" %in% METHODS_TO_USE) {
-        ok <- ordinary_kriging_predict(observed, missing, coord_cols)
+      manifest_rows[[counter]] <- result$manifest
 
-        ok_out <- copy(base_cols)
-        ok_out[, method := "centroid_ordinary_kriging"]
-        ok_out[, prediction := ok$prediction]
-        ok_out[, nearest_distance := NA_real_]
-        ok_out[, kriging_variance := ok$kriging_variance]
-        ok_out[, ok_fallback := ok$ok_fallback]
-
-        append_predictions(ok_out)
-        total_prediction_rows <- total_prediction_rows + nrow(ok_out)
-      }
-
-      total_missing <- total_missing + n_miss
-
-      manifest_parts[[length(manifest_parts) + 1L]] <- data.table(
-        file_id = file_id_from_path(pass_name, path),
-        date = as.character(date),
-        year = year,
-        pass = pass_name,
-        source_file = path,
-        n_rows = nrow(dt),
-        n_observed = n_obs,
-        n_missing_target = n_miss,
-        n_methods = length(METHODS_TO_USE),
-        n_prediction_rows = n_miss * length(METHODS_TO_USE)
-      )
-
-      if (scanned %% 100 == 0) {
-        message(
-          "  scanned ", scanned, "/", total_files,
-          "; missing rows so far: ", total_missing
-        )
+      if (counter %% 100 == 0 || counter == total_files) {
+        message("  processed ", counter, "/", total_files, " files")
       }
     }
   }
 
-  manifest <- rbindlist(manifest_parts, fill = TRUE)
-  fwrite(manifest, MANIFEST_PATH)
+  manifest_dt <- rbindlist(manifest_rows, fill = TRUE)
+  fwrite(manifest_dt, MANIFEST_PATH)
 
-  message("\nSaved:")
-  message("  ", PRED_PATH)
-  message("  ", MANIFEST_PATH)
-
-  message("\nSummary:")
-  message("  Files scanned: ", total_files)
-  message("  Real missing rows found: ", total_missing)
-  message("  Interpolation prediction rows written: ", total_prediction_rows)
-  message("  Methods used: ", paste(METHODS_TO_USE, collapse = ", "))
-
+  message("\nSaved predictions: ", PRED_PATH)
+  message("Saved manifest:    ", MANIFEST_PATH)
+  message("\nStatus counts:")
+  print(manifest_dt[, .N, by = status])
   message("\nDone.")
 }
-
 
 main()

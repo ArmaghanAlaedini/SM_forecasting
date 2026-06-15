@@ -1,24 +1,54 @@
-name: py310
+name: py312
+
 channels:
   - conda-forge
+  - gurobi
   - defaults
-  - gurobi
+
 dependencies:
-  - python=3.10
+  # Python
+  - python=3.12
   - numpy
+  - pandas
+  - scipy
+  - scikit-learn
+  - xgboost
+  - joblib
+  - matplotlib
   - seaborn
-  - jupyterlab
-  - pykrige
-  - gurobi
+  - geopandas
+  - shapely
+  - pyproj
+  - fiona
+  - pyarrow
+  - openpyxl
+
+  # NetCDF / raster / gridded data
   - h5netcdf
   - h5py
-  - matplotlib
   - netcdf4
   - xarray
-  - pandas
+  - rasterio
+
+  # Kriging / interpolation
+  - pykrige
+  - pyinterpolate
+
+  # Optimization / utilities
+  - gurobi
+  - jupyterlab
+  - ipython
   - black
   - tk
-  - ipython
-  - pyinterpolate
-  - scikit-learn
 
+  # R base and R packages used by the R scripts
+  - r-base
+  - r-data.table
+  - r-ggplot2
+  - r-sf
+  - r-sp
+  - r-gstat
+  - r-terra
+  - r-sftime
+  - r-renv
+  - r-remotes

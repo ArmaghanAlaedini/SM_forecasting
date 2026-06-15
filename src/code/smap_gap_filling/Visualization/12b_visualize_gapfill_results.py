@@ -38,7 +38,7 @@ import pandas as pd
 
 # Change this day whenever you want.
 # Format can be "YYYY-MM-DD" or "YYYYMMDD".
-SELECTED_DATE = "2025-05-28"
+SELECTED_DATE = "2025-08-19"
 
 # Use "am" or "pm".
 PASS_NAME = "am"
