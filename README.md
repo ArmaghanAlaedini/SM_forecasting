@@ -1,13 +1,14 @@
 # 🛰️ Soil Moisture Forecasting Using Reconstructed SMAP Data (Iowa)
 
+
 This repository contains a Python/R pipeline for:
 1. **Gap-filling** daily NASA SMAP L3 soil moisture observations over Iowa
-2. **Forecasting** future soil moisture from gap-filled history *(coming soon)*
-3. **Downscaling** forecasts to Iowa township level via area-to-area kriging *(coming soon)*
+2. **Forecasting** future soil moisture from gap-filled history *(TBC)*
+3. **Downscaling** forecasts to Iowa township level via area-to-area kriging *(TBC)*
 
 > **Note:** Raw SMAP NC4 files and IEM station data are **not included** in this repository.
-> SMAP data can be downloaded from [NASA Earthdata / NSIDC](https://nsidc.org/data/smap).
-> IEM station data can be downloaded from [Iowa Environmental Mesonet](https://mesonet.agron.iastate.edu).
+> SMAP data: [NASA Earthdata / NSIDC](https://nsidc.org/data/smap).
+> IEM station data: [Iowa Environmental Mesonet](https://mesonet.agron.iastate.edu).
 
 ---
 
@@ -20,7 +21,8 @@ three stages:
 **Stage 1 — Gap-Filling (complete)**
 Missing SMAP pixels are filled using a layered stacking approach combining
 point-to-area kriging of IEM weather station data with machine learning models
-(XGBoost, HistGBDT, Random Forest) and a Ridge stacking meta-model.
+(XGBoost, HistGBDT, Random Forest), regression kriging, and a Ridge stacking meta-model
+that learns the optimal blend of all base predictions from 2024 validation data.
 
 **Stage 2 — Forecasting (TBC)**
 The complete gap-filled daily SM grids will be used to train a forecasting model
@@ -34,6 +36,9 @@ area-to-area kriging, producing township-level soil moisture forecast products.
 - Train: 2020–2023
 - Validation: 2024
 - Test: 2025
+
+> **HPC note:** Paths below are specific to the ISU Nova cluster. Adjust
+> `HPC_PROJECT`, `MAMBA_ROOT_PREFIX`, and partition names for other systems.
 
 ---
 
@@ -62,6 +67,12 @@ SM_forecasting/
 │       │   ├── 11b_generate_interpolation_gapfill_predictions.R
 │       │   ├── 11c_stack_and_finalize_gapfills.py
 │       │   └── Visualization/
+│       │       ├── 02_visualize_lattice.py
+│       │       ├── 04_visualize_iem_pta.py
+│       │       ├── 06_visualize_full_smap_iem_one_day.py
+│       │       ├── 08_visualize_complete_on_iowa_boundaries.py
+│       │       ├── 12a_visualize_validation_results.py
+│       │       └── 12b_visualize_gapfill_results.py
 │       │
 │       ├── smap_forecasting/          ← Stage 2: planned
 │       │   └── (coming soon)
@@ -80,6 +91,32 @@ SM_forecasting/
 
 ## ✅ Stage 1 — Gap-Filling
 
+### How It Works
+
+Missing SMAP pixels are filled through a stacking ensemble. Five base models each produce
+a prediction for every missing pixel:
+
+- centroid ordinary kriging — spatial polynomial detrend → krige residuals → add trend back
+- regression kriging — fits an OLS trend on IEM weather covariates, then kriges residuals
+- nearest-neighbor same-day — assigns the value of the closest observed pixel
+- XGBoost, HistGBDT, Random Forest — trained on 2020–2023 observed pixels with IEM features
+
+All three kriging processes in this pipeline follow the same detrend → krige
+residuals → add trend back structure, differing only in the trend model:
+
+- **IEM point-to-area kriging** (`03`) — spatial quadratic trend on station coordinates
+- **centroid ordinary kriging** — spatial quadratic trend on SMAP pixel coordinates
+- **regression kriging** — OLS trend on IEM weather covariates
+
+In every case the trend is used only if it is statistically meaningful
+(F-test p < 0.05 and R² > 0.01); otherwise the method falls back to plain
+ordinary kriging, so detrending never reduces accuracy.
+
+A Ridge regression meta-model (trained on 2024 spatial-block holdout predictions)
+learns the optimal weighted combination of all five base predictions. Where the
+meta-model cannot predict (all base predictions are NaN), a waterfall fallback
+applies the base methods in priority order.
+
 ### Script Descriptions
 
 `00_config.py` — Central configuration. All file paths, year settings, CRS, kriging
@@ -90,7 +127,7 @@ parameters, and runtime limits. All other scripts load this.
 
 `03_iem_pta_kriging.py` — For each day in 2020–2025, kriges 20 IEM weather variables
 from station points to SMAP polygon centroids. Uses detrended ordinary kriging:
-fit quadratic spatial trend → krige residuals → add trend back.
+quadratic spatial trend → krige residuals → add trend back.
 
 `05_full_smap_iem.py` — Merges observed SMAP soil moisture with kriged IEM values
 into complete daily files. Saves complete/observed/missing splits.
@@ -102,35 +139,42 @@ were preserved correctly.
 correlations, feature importances, and model scores across feature groups.
 
 `10a_ML_validation.py` — Trains and validates ML models on 2024 observed pixels
-using artificial holdouts (random-cell and spatial-block). Saves per-pixel predictions.
+using artificial holdouts (random-cell and spatial-block).
 
-`10b_interpolation_validation.R` — Validates centroid ordinary kriging and
-nearest-neighbor on 2024 using the same holdout design.
+`10b_interpolation_validation.R` — Validates centroid ordinary kriging,
+regression kriging, and nearest-neighbor on 2024 using the same holdout design.
+Both kriging methods detrend before kriging (centroid OK uses a spatial x/y
+polynomial trend; regression kriging uses IEM covariates), krige the residuals,
+then add the trend back.
 
 `10c_compare_validation_results.py` — Reads outputs from 10a and 10b, ranks all
-methods by RMSE under spatial-block validation, and writes a recommendation table.
+methods by RMSE under spatial-block validation, writes recommendation table.
 
 `10d_selected_methods_test.py` — Tests selected ML models on 2025 held-out data.
 
-`10e_selected_interpolation_test.R` — Tests kriging/nearest-neighbor on 2025.
+`10e_selected_interpolation_test.R` — Tests interpolation methods on 2025.
 
 `10f_generate_stacking_meta_features.py` — Joins per-pixel predictions from all
 base models into a single meta-training table using 2024 spatial-block holdout rows.
 
-`10g_train_stacking_meta_model.py` — Trains a Ridge regression meta-model on the
-meta-training table. Saves `meta_model.joblib`.
+`10g_train_stacking_meta_model.py` — Trains a Ridge regression meta-model that
+learns the optimal weights for combining all base predictions. Saves
+`meta_model.joblib` and a coefficient table showing how much each method contributes.
 
-`11_gapfilling_setting.py` — Manual controls: which models to use, which years to
-fill, stacking meta-model path, clipping options.
+`11_gapfilling_setting.py` — Manual controls: which models to use, which years
+to fill, stacking meta-model path, clipping options.
 
 `11a_generate_ml_gapfill_predictions.py` — Trains ML models on 2020–2023 and
 predicts all real missing pixels across 2020–2025.
 
-`11b_generate_interpolation_gapfill_predictions.R` — Runs centroid ordinary kriging
-and nearest-neighbor on real missing pixels across all years.
+`11b_generate_interpolation_gapfill_predictions.R` — Runs centroid ordinary kriging,
+regression kriging, and nearest-neighbor on real missing pixels across all years.
+Both kriging methods detrend before kriging then add the trend back.
 
-`11c_stack_and_finalize_gapfills.py` — Applies stacking meta-model and writes final
-gap-filled CSV files. Falls back to waterfall (kriging → NN → ML) where needed.
+`11c_stack_and_finalize_gapfills.py` — Applies stacking meta-model to combine all
+base predictions and writes final gap-filled CSV files. Falls back to a priority
+waterfall (centroid OK → regression kriging → nearest-neighbor → ML models) for
+any pixel where the meta-model returns NaN.
 
 ### How to Run (Stage 1)
 
@@ -154,12 +198,9 @@ python src/code/smap_gap_filling/11c_stack_and_finalize_gapfills.py
 
 **HPC (Nova — Iowa State University):**
 ```bash
-# One-time setup from laptop:
-bash setup_hpc.sh
+bash setup_hpc.sh  # one-time laptop setup
 
-# Submit full pipeline on HPC:
 cd /work/estherjo/alaedini/projects/gap-filling
-
 J03=$(sbatch sbatch/run_03_iem_kriging.sbatch | awk '{print $4}')
 J05=$(sbatch --dependency=afterok:$J03 sbatch/run_05_full_smap_iem.sbatch | awk '{print $4}')
 J09=$(sbatch --dependency=afterok:$J05 sbatch/run_09_feature_selection.sbatch | awk '{print $4}')
@@ -193,10 +234,10 @@ python src/code/smap_gap_filling/Visualization/12a_visualize_validation_results.
 python src/code/smap_gap_filling/Visualization/12b_visualize_gapfill_results.py
 ```
 
-For `12b`, edit the user controls at the top of the file:
+For `12b`, edit the user controls at the top:
 ```python
-SELECTED_DATE = "2025-08-19"   # any date you want to visualize
-PASS_NAME = "am"               # "am" or "pm"
+SELECTED_DATE = "2025-08-19"    # any date you want to visualize
+PASS_NAME     = "am"            # "am" or "pm"
 ```
 
 ### Stage 1 Outputs
@@ -206,7 +247,10 @@ src/data/processed/smap_gap_filling/
 ├── iem_point_to_area/           # Daily kriged IEM variables per SMAP pixel
 ├── 03_full_smap_iem_data/       # Complete daily SMAP + IEM files
 ├── 04_feature_screening/        # Feature importance tables and figures
-├── 05_gapfill_model_validation/ # Validation metrics, predictions, meta-model
+├── 05_gapfill_model_validation/ # Validation metrics, predictions, stacking model
+│   └── stacking/
+│       ├── meta_model.joblib          # Ridge stacking meta-model
+│       └── meta_model_coefficients.csv  # Learned weights per base model
 ├── 07_gapfill_predictions/      # Base model predictions for real missing pixels
 └── 08_gapfilled_final/          # ← Main output: complete daily SM grids
     ├── am/                      # AM pass files (2020–2025)
@@ -219,7 +263,9 @@ Each final file contains one row per SMAP pixel with:
 - `soil_moisture` — original observed value (NaN if missing)
 - `soil_moisture_filled` — gap-filled value
 - `fill_status` — `observed`, `filled`, or `unfilled`
-- `fill_method` — which method filled each pixel
+- `fill_method` — which method filled each pixel: `observed`, `stacking`,
+  `centroid_ordinary_kriging`, `regression_kriging`, `nearest_neighbor_same_day`,
+  `xgboost`, `hist_gbdt`, or `random_forest`
 
 ---
 

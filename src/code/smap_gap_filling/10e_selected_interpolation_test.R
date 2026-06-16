@@ -7,8 +7,13 @@
 # This script does NOT select methods. It only tests the methods selected from
 # 2024 validation / 10c:
 #
-#   centroid_ordinary_kriging
+#   centroid_ordinary_kriging   -- spatial detrend (x/y polynomial) + krige residuals + add trend
 #   nearest_neighbor_same_day
+#   regression_kriging           -- IEM covariate trend + krige residuals + add trend
+#
+# Both kriging methods detrend before kriging. They differ in the trend model:
+#   centroid OK uses a spatial x/y polynomial trend.
+#   regression kriging uses IEM weather covariates as the trend.
 #
 # Design:
 #   Test: 2025 observed SMAP with artificial holdouts
@@ -61,6 +66,20 @@ MIN_OBSERVED_ROWS_PER_FILE <- 30L
 MAX_FILES_PER_PASS <- NULL
 
 NN_CHUNK_SIZE <- 500L
+
+# Spatial detrend control for centroid OK.
+# Trend used only if OLS fit is meaningful (F p < threshold AND R2 > threshold),
+# else plain OK (detrending never hurts).
+CENTROID_OK_DETREND      <- TRUE
+CENTROID_OK_TREND_PVALUE <- 0.05
+CENTROID_OK_TREND_R2     <- 0.01
+
+# IEM covariate columns used as the regression-kriging trend model.
+# Only columns present with enough non-NA values are used.
+RK_IEM_COVARIATES <- c(
+  "soil04t_pta", "soil12vwc_pta", "soil24vwc_pta",
+  "soil50vwc_pta", "precip_pta", "et_pta", "rh_pta"
+)
 
 
 # ============================================================
@@ -340,6 +359,44 @@ nearest_neighbor_predict <- function(obs, target, coord_cols) {
 }
 
 
+# ============================================================
+# SPATIAL TREND HELPERS (shared by centroid OK detrending)
+# ============================================================
+
+make_spatial_trend_features <- function(x, y, x_mean_km, y_mean_km) {
+  x0 <- (x / 1000.0) - x_mean_km
+  y0 <- (y / 1000.0) - y_mean_km
+  data.frame(x = x0, y = y0, x2 = x0^2, y2 = y0^2, xy = x0 * y0)
+}
+
+fit_spatial_trend <- function(x, y, z) {
+  x_mean_km <- mean(x / 1000.0, na.rm = TRUE)
+  y_mean_km <- mean(y / 1000.0, na.rm = TRUE)
+  feats <- make_spatial_trend_features(x, y, x_mean_km, y_mean_km)
+  df <- cbind(data.frame(z = z), feats)
+
+  model <- tryCatch(lm(z ~ x + y + x2 + y2 + xy, data = df), error = function(e) NULL)
+  if (is.null(model)) return(NULL)
+
+  fstat  <- tryCatch(summary(model)$fstatistic, error = function(e) NULL)
+  r2     <- tryCatch(summary(model)$r.squared,   error = function(e) NA_real_)
+  pvalue <- if (!is.null(fstat))
+    stats::pf(fstat[1], fstat[2], fstat[3], lower.tail = FALSE) else NA_real_
+
+  trend_used <- is.finite(pvalue) && is.finite(r2) &&
+    pvalue < CENTROID_OK_TREND_PVALUE && r2 > CENTROID_OK_TREND_R2
+
+  list(model = model, trend_used = trend_used,
+       x_mean_km = x_mean_km, y_mean_km = y_mean_km, r2 = r2, pvalue = pvalue)
+}
+
+predict_spatial_trend <- function(info, x, y) {
+  if (is.null(info) || !info$trend_used) return(rep(0.0, length(x)))
+  feats <- make_spatial_trend_features(x, y, info$x_mean_km, info$y_mean_km)
+  as.numeric(predict(info$model, newdata = feats))
+}
+
+
 ordinary_kriging_predict <- function(obs, target, coord_cols) {
   out <- data.table(
     prediction = rep(NA_real_, nrow(target)),
@@ -370,46 +427,46 @@ ordinary_kriging_predict <- function(obs, target, coord_cols) {
   }
 
   result <- tryCatch({
-    obs_sp <- as.data.frame(obs)
-    target_sp <- as.data.frame(target[target_valid])
+    cx <- coord_cols[1]
+    cy <- coord_cols[2]
 
-    sp::coordinates(obs_sp) <- stats::as.formula(
-      paste("~", paste(coord_cols, collapse = "+"))
-    )
+    obs_x <- as_num(obs[[cx]]); obs_y <- as_num(obs[[cy]])
+    obs_z <- as_num(obs[[TARGET]])
+    tgt   <- target[target_valid]
+    tgt_x <- as_num(tgt[[cx]]); tgt_y <- as_num(tgt[[cy]])
 
-    sp::coordinates(target_sp) <- stats::as.formula(
-      paste("~", paste(coord_cols, collapse = "+"))
-    )
+    # --- Spatial detrend step ---
+    trend_info <- NULL
+    if (CENTROID_OK_DETREND) {
+      trend_info <- fit_spatial_trend(obs_x, obs_y, obs_z)
+    }
+    obs_trend <- predict_spatial_trend(trend_info, obs_x, obs_y)
+    tgt_trend <- predict_spatial_trend(trend_info, tgt_x, tgt_y)
 
-    vals <- obs[[TARGET]]
-    v <- stats::var(vals, na.rm = TRUE)
+    obs_resid <- obs_z - obs_trend
 
+    obs_sp <- data.frame(resid = obs_resid, x = obs_x, y = obs_y)
+    target_sp <- data.frame(x = tgt_x, y = tgt_y)
+
+    sp::coordinates(obs_sp) <- ~ x + y
+    sp::coordinates(target_sp) <- ~ x + y
+
+    v <- stats::var(obs_resid, na.rm = TRUE)
     if (!is.finite(v) || v <= 0) {
-      stop("Non-positive variance in observed values.")
+      stop("Non-positive variance in detrended residuals.")
     }
 
-    xr <- range(obs[[coord_cols[1]]], na.rm = TRUE)
-    yr <- range(obs[[coord_cols[2]]], na.rm = TRUE)
+    xr <- range(obs_x, na.rm = TRUE)
+    yr <- range(obs_y, na.rm = TRUE)
     diag_range <- sqrt(diff(xr)^2 + diff(yr)^2)
-
-    if (!is.finite(diag_range) || diag_range <= 0) {
-      diag_range <- 1
-    }
+    if (!is.finite(diag_range) || diag_range <= 0) diag_range <- 1
 
     init_model <- gstat::vgm(
-      psill = 0.8 * v,
-      model = "Exp",
-      range = diag_range / 3,
-      nugget = 0.2 * v
+      psill = 0.8 * v, model = "Exp",
+      range = diag_range / 3, nugget = 0.2 * v
     )
 
-    emp <- suppressWarnings(
-      gstat::variogram(
-        stats::as.formula(paste(TARGET, "~ 1")),
-        obs_sp
-      )
-    )
-
+    emp <- suppressWarnings(gstat::variogram(resid ~ 1, obs_sp))
     fit <- tryCatch(
       suppressWarnings(gstat::fit.variogram(emp, init_model)),
       error = function(e) init_model,
@@ -417,24 +474,121 @@ ordinary_kriging_predict <- function(obs, target, coord_cols) {
     )
 
     kr <- suppressWarnings(
-      gstat::krige(
-        stats::as.formula(paste(TARGET, "~ 1")),
-        obs_sp,
-        target_sp,
-        model = fit,
-        debug.level = 0
-      )
+      gstat::krige(resid ~ 1, obs_sp, target_sp, model = fit, debug.level = 0)
     )
 
     list(
       ok = TRUE,
       target_rows = which(target_valid),
-      pred = as_num(kr$var1.pred),
+      pred = as_num(kr$var1.pred) + tgt_trend,   # add spatial trend back
       var = as_num(kr$var1.var)
     )
   }, error = function(e) {
     list(ok = FALSE, error = conditionMessage(e))
   })
+
+  if (isTRUE(result$ok)) {
+    out[result$target_rows, prediction := result$pred]
+    out[result$target_rows, kriging_variance := result$var]
+    return(out)
+  }
+
+  nn <- nearest_neighbor_predict(obs, target, coord_cols)
+  out[, prediction := nn$prediction]
+  out[, ok_fallback := TRUE]
+  out
+}
+
+
+regression_kriging_predict <- function(obs, target, coord_cols) {
+  out <- data.table(
+    prediction = rep(NA_real_, nrow(target)),
+    kriging_variance = rep(NA_real_, nrow(target)),
+    ok_fallback = rep(FALSE, nrow(target))
+  )
+
+  obs <- copy(obs)
+  target <- copy(target)
+
+  cx <- coord_cols[1]
+  cy <- coord_cols[2]
+
+  obs[, (TARGET) := as_num(get(TARGET))]
+  for (cc in coord_cols) {
+    obs[, (cc) := as_num(get(cc))]
+    target[, (cc) := as_num(get(cc))]
+  }
+
+  obs <- obs[is.finite(get(TARGET))]
+  obs <- obs[complete.cases(obs[, ..coord_cols])]
+  target_valid <- complete.cases(target[, ..coord_cols])
+
+  if (nrow(obs) < MIN_OBSERVED_ROWS_PER_FILE || !any(target_valid)) {
+    nn <- nearest_neighbor_predict(obs, target, coord_cols)
+    out[, prediction := nn$prediction]
+    out[, ok_fallback := TRUE]
+    return(out)
+  }
+
+  obs_df <- as.data.frame(obs)
+  tgt_df <- as.data.frame(target[target_valid])
+
+  available_covs <- intersect(RK_IEM_COVARIATES, names(obs_df))
+  available_covs <- available_covs[sapply(available_covs, function(v) {
+    vals <- as_num(obs_df[[v]])
+    sum(is.finite(vals)) >= 8
+  })]
+  for (v in available_covs) {
+    obs_df[[v]] <- as_num(obs_df[[v]])
+    tgt_df[[v]] <- as_num(tgt_df[[v]])
+  }
+
+  result <- tryCatch({
+    formula_str <- if (length(available_covs) > 0)
+      paste(TARGET, "~", paste(available_covs, collapse = " + "))
+    else paste(TARGET, "~", cx, "+", cy)
+
+    lm_fit <- lm(as.formula(formula_str), data = obs_df, na.action = na.omit)
+
+    obs_df$rk_residual <- NA_real_
+    fitted_idx <- as.integer(rownames(model.frame(lm_fit)))
+    obs_df$rk_residual[fitted_idx] <- residuals(lm_fit)
+
+    obs_ok <- obs_df[is.finite(obs_df$rk_residual) &
+                     is.finite(obs_df[[cx]]) & is.finite(obs_df[[cy]]), ]
+    if (nrow(obs_ok) < MIN_OBSERVED_ROWS_PER_FILE) stop("Too few residual rows.")
+
+    obs_sp <- data.frame(resid = obs_ok$rk_residual,
+                         x = obs_ok[[cx]], y = obs_ok[[cy]])
+    target_sp <- data.frame(x = tgt_df[[cx]], y = tgt_df[[cy]])
+    sp::coordinates(obs_sp) <- ~ x + y
+    sp::coordinates(target_sp) <- ~ x + y
+
+    v <- stats::var(obs_ok$rk_residual, na.rm = TRUE)
+    if (!is.finite(v) || v <= 0) stop("Non-positive residual variance.")
+
+    xr <- range(obs_ok[[cx]], na.rm = TRUE)
+    yr <- range(obs_ok[[cy]], na.rm = TRUE)
+    diag_range <- sqrt(diff(xr)^2 + diff(yr)^2)
+    if (!is.finite(diag_range) || diag_range <= 0) diag_range <- 1
+
+    init_model <- gstat::vgm(psill = 0.8 * v, model = "Exp",
+                             range = diag_range / 3, nugget = 0.2 * v)
+    emp <- suppressWarnings(gstat::variogram(resid ~ 1, obs_sp))
+    fit <- tryCatch(
+      suppressWarnings(gstat::fit.variogram(emp, init_model)),
+      error = function(e) init_model, warning = function(w) init_model
+    )
+    kr <- suppressWarnings(
+      gstat::krige(resid ~ 1, obs_sp, target_sp, model = fit, debug.level = 0)
+    )
+
+    rk_trend <- as_num(predict(lm_fit, newdata = tgt_df))
+
+    list(ok = TRUE, target_rows = which(target_valid),
+         pred = rk_trend + as_num(kr$var1.pred),
+         var = as_num(kr$var1.var))
+  }, error = function(e) list(ok = FALSE, error = conditionMessage(e)))
 
   if (isTRUE(result$ok)) {
     out[result$target_rows, prediction := result$pred]
@@ -620,6 +774,25 @@ main <- function() {
         )
 
         pred_parts[[length(pred_parts) + 1L]] <- ok_out
+
+        rk <- regression_kriging_predict(train_obs, hidden, coord_cols)
+
+        rk_out <- data.table(
+          split = "test",
+          holdout_mode = holdout_mode,
+          date = as.character(date),
+          pass = pass_name,
+          smap_pixel_key = hidden[[KEY]],
+          method = "regression_kriging",
+          observed = hidden[[TARGET]],
+          prediction = rk$prediction,
+          nearest_distance = NA_real_,
+          kriging_variance = rk$kriging_variance,
+          ok_fallback = rk$ok_fallback,
+          source_file = path
+        )
+
+        pred_parts[[length(pred_parts) + 1L]] <- rk_out
       }
     }
   }
