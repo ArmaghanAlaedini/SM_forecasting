@@ -117,17 +117,13 @@ SUPPORT_DIR = GAP_FILLING_DIR / "support"
 
 SMAP_LATTICE_DIR = SUPPORT_DIR / "smap_lattice"
 
-PREPROCESS_SMAP_DIR = GAP_FILLING_DIR / "01_preprocess_smap"
-PREPROCESS_SMAP_AM_DIR = PREPROCESS_SMAP_DIR / "am"
-PREPROCESS_SMAP_PM_DIR = PREPROCESS_SMAP_DIR / "pm"
-
 # IEM point-to-area kriged daily outputs.
 # Daily CSV files will be saved directly here.
 IEM_PTA_DIR = GAP_FILLING_DIR / "iem_point_to_area"
 
-PREPROCESS_FINAL_DIR = GAP_FILLING_DIR / "02_preprocess_final"
-PREPROCESS_FINAL_AM_DIR = PREPROCESS_FINAL_DIR / "am"
-PREPROCESS_FINAL_PM_DIR = PREPROCESS_FINAL_DIR / "pm"
+# NOTE: the old "01_preprocess_smap" and "02_preprocess_final" folders were
+# never written to by any script (only defined here), so they have been
+# removed. The real pipeline outputs start at "03_full_smap_iem_data".
 
 
 # ============================================================
@@ -136,9 +132,12 @@ PREPROCESS_FINAL_PM_DIR = PREPROCESS_FINAL_DIR / "pm"
 
 PASSES = ["am", "pm"]
 
-TRAIN_YEARS = [2020, 2021, 2022, 2023] # removed 2024 for validation
+TRAIN_YEARS = [2020, 2021, 2022, 2023]
+VALIDATION_YEARS = [2024]   # held-out year used to train the stacking meta-model
 TEST_YEAR = 2025
-ALL_YEARS = TRAIN_YEARS + [TEST_YEAR] # it's fine
+# 2024 MUST be included here, otherwise 03/05 never build the validation year
+# and 10a/10b find "0 files in the validation split".
+ALL_YEARS = TRAIN_YEARS + VALIDATION_YEARS + [TEST_YEAR]
 
 CRS_WGS84 = 4326
 CRS_EASE = 6933
@@ -312,28 +311,16 @@ def list_smap_files(
     return _limit_files(files, max_files)
 
 
-def get_preprocess_smap_dir(pass_name: str) -> Path:
-    pass_name = pass_name.lower()
-
-    if pass_name == "am":
-        return PREPROCESS_SMAP_AM_DIR
-
-    if pass_name == "pm":
-        return PREPROCESS_SMAP_PM_DIR
-
-    raise ValueError("pass_name must be 'am' or 'pm'.")
+def get_preprocess_smap_dir(pass_name: str) -> Path:  # deprecated, kept as no-op stub
+    raise NotImplementedError(
+        "01_preprocess_smap was removed; nothing uses this folder anymore."
+    )
 
 
-def get_preprocess_final_dir(pass_name: str) -> Path:
-    pass_name = pass_name.lower()
-
-    if pass_name == "am":
-        return PREPROCESS_FINAL_AM_DIR
-
-    if pass_name == "pm":
-        return PREPROCESS_FINAL_PM_DIR
-
-    raise ValueError("pass_name must be 'am' or 'pm'.")
+def get_preprocess_final_dir(pass_name: str) -> Path:  # deprecated, kept as no-op stub
+    raise NotImplementedError(
+        "02_preprocess_final was removed; nothing uses this folder anymore."
+    )
 
 
 # ============================================================
@@ -349,13 +336,7 @@ def ensure_output_dirs() -> None:
         GAP_FILLING_DIR,
         SUPPORT_DIR,
         SMAP_LATTICE_DIR,
-        PREPROCESS_SMAP_DIR,
-        PREPROCESS_SMAP_AM_DIR,
-        PREPROCESS_SMAP_PM_DIR,
         IEM_PTA_DIR,
-        PREPROCESS_FINAL_DIR,
-        PREPROCESS_FINAL_AM_DIR,
-        PREPROCESS_FINAL_PM_DIR,
         FULL_SMAP_IEM_DIR,
         FULL_SMAP_IEM_AM_DIR,
         FULL_SMAP_IEM_PM_DIR,
@@ -399,14 +380,14 @@ def print_config_summary() -> None:
 
     print("Outputs")
     print("-" * 60)
-    print(f"SMAP preprocess output:   {PREPROCESS_SMAP_DIR}")
     print(f"IEM PTA output:           {IEM_PTA_DIR}")
-    print(f"Final preprocess output:  {PREPROCESS_FINAL_DIR}")
+    print(f"Full SMAP+IEM output:     {FULL_SMAP_IEM_DIR}")
     print()
 
     print("Study settings")
     print("-" * 60)
     print(f"Train years:              {TRAIN_YEARS}")
+    print(f"Validation years:         {VALIDATION_YEARS}")
     print(f"Test year:                {TEST_YEAR}")
     print(f"All years:                {ALL_YEARS}")
     print(f"CRS WGS84:                EPSG:{CRS_WGS84}")

@@ -43,7 +43,7 @@ test.py
 src/code/smap/smap_lat_long.py
 src/code/archived_forecast/api_test.py
 src/code/archived_forecast/hrrr_test
-
+src/code/smap_gap_filling/inspect_gapfilled.py
 # ============================================================
 # Data: raw, processed, generated
 # ============================================================

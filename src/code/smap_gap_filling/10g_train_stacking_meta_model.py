@@ -77,7 +77,7 @@ def compute_metrics(y_true, y_pred) -> dict:
 
 def make_meta_pipeline(alphas) -> Pipeline:
     return Pipeline([
-        ("imputer", SimpleImputer(strategy="median")),
+        ("imputer", SimpleImputer(strategy="median", keep_empty_features=True)),
         ("scaler",  StandardScaler()),
         ("ridge",   RidgeCV(alphas=alphas, fit_intercept=True)),
     ])
@@ -85,6 +85,23 @@ def make_meta_pipeline(alphas) -> Pipeline:
 
 def get_feature_cols(df: pd.DataFrame) -> list[str]:
     wanted  = BASE_PRED_COLS + META_EXTRA_FEATURES
+
+    # Fail loudly if a base predictor (e.g. regression_kriging) is missing or
+    # entirely empty, instead of silently training without it.
+    missing_cols = [c for c in BASE_PRED_COLS if c not in df.columns]
+    if missing_cols:
+        raise ValueError(
+            f"Meta table is missing base predictor columns: {missing_cols}. "
+            "A base method produced no predictions upstream (re-run 10b / 10a)."
+        )
+    empty_cols = [c for c in BASE_PRED_COLS if df[c].notna().sum() == 0]
+    if empty_cols:
+        raise ValueError(
+            f"Base predictor columns are entirely empty: {empty_cols}. "
+            "Most likely regression_kriging was skipped in 10b. Fix 10b first, "
+            "then re-run 10f and 10g."
+        )
+
     present = [c for c in wanted if c in df.columns]
     if not present:
         raise ValueError(f"No recognised feature columns in meta table. Expected: {wanted}")

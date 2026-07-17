@@ -19,8 +19,8 @@ import matplotlib.pyplot as plt
 
 def load_config():
     """Load 00_config.py even though the filename starts with a number."""
-    config_path = Path(__file__).resolve().with_name("00_config.py")
-
+    config_path = Path(__file__).resolve().parent.parent / "00_config.py"
+    
     spec = importlib.util.spec_from_file_location("cfg", config_path)
     cfg = importlib.util.module_from_spec(spec)
 

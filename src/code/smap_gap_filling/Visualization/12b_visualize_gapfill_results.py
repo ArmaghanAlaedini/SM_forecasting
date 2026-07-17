@@ -38,7 +38,7 @@ import pandas as pd
 
 # Change this day whenever you want.
 # Format can be "YYYY-MM-DD" or "YYYYMMDD".
-SELECTED_DATE = "2025-08-19"
+SELECTED_DATE = "2025-01-01"
 
 # Use "am" or "pm".
 PASS_NAME = "am"
@@ -69,7 +69,7 @@ PREFER_LON_LAT_FOR_STATION_OVERLAY = True
 
 STATION_POINT_SIZE = 18
 STATION_POINT_ALPHA = 0.90
-STATION_POINT_LABEL = "IEM stations"
+STATION_POINT_LABEL = "Weather stations"
 
 
 # ============================================================
@@ -77,7 +77,7 @@ STATION_POINT_LABEL = "IEM stations"
 # ============================================================
 
 SCRIPT_DIR = Path(__file__).resolve().parent
-SETTINGS_PATH = SCRIPT_DIR / "11_gapfilling_setting.py"
+SETTINGS_PATH = SCRIPT_DIR.parent / "11_gapfilling_setting.py"
 
 if SETTINGS_PATH.exists():
     spec = importlib.util.spec_from_file_location("gapfill_settings", SETTINGS_PATH)
@@ -542,7 +542,7 @@ def plot_value_map(
         c=val[mask],
         s=size,
         marker="s",
-        cmap="viridis",
+        cmap="viridis_r", # reverse of "viridis"
         vmin=vmin,
         vmax=vmax,
         linewidths=0,
@@ -606,7 +606,7 @@ def plot_before_after(
     if added1:
         axes[1].legend(loc="best", frameon=True)
 
-    cbar = fig.colorbar(sc1, ax=axes, shrink=0.82)
+    cbar = fig.colorbar(sc1, ax=axes, shrink=0.5, aspect=40)
     cbar.set_label("Soil moisture")
 
     out = FIG_DIR / f"before_after_gapfill_{pass_name}_{safe_name(pretty_date)}.png"

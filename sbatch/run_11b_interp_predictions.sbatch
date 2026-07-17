@@ -9,12 +9,16 @@
 #SBATCH --mem=32G
 #SBATCH --partition=nova
 
-export SMAP_PROJECT_ROOT=/work/estherjo/alaedini/projects/iem_pta_kriging
+export SMAP_PROJECT_ROOT=/work/estherjo/alaedini/projects/gap-filling
 cd $SMAP_PROJECT_ROOT
 mkdir -p logs
 
 module purge
-module load module load r/4.5.1-py311-ggqalmr
+module load micromamba
+export MAMBA_ROOT_PREFIX=/work/estherjo/alaedini/micromamba
+eval "$(micromamba shell hook --shell=bash)"
+micromamba activate smap_r
+export RENV_CONFIG_AUTOLOADER_ENABLED=FALSE
 
 echo "Starting 11b at $(date)"
 Rscript src/code/smap_gap_filling/11b_generate_interpolation_gapfill_predictions.R

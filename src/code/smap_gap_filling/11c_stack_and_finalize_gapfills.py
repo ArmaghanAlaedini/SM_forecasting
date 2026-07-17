@@ -2,11 +2,14 @@
 """
 11c_stack_and_finalize_gapfills.py
 -- updated to include pred_regression_kriging in META_FEATURE_COLS --
+-- MEMORY-SAFE: prediction files are split once into per-file pieces and read
+   one day at a time, instead of loading the whole 12GB+1.4GB into RAM. --
 """
 
 from __future__ import annotations
 import importlib.util
 import re
+import shutil
 import warnings
 from pathlib import Path
 import numpy as np
@@ -28,6 +31,14 @@ ML_PRED_PATH     = settings.PREDICTION_DIR / "ml/ml_gapfill_predictions.csv"
 INTERP_PRED_PATH = settings.PREDICTION_DIR / "interpolation/interpolation_gapfill_predictions.csv"
 SUMMARY_BY_FILE_PATH = settings.FINAL_DIR / "gapfill_summary_by_file.csv"
 OVERALL_SUMMARY_PATH = settings.FINAL_DIR / "gapfill_overall_summary.csv"
+
+# Temp location for the per-file split of the (huge) prediction CSVs.
+SPLIT_ROOT       = settings.PREDICTION_DIR / "_split_by_file_11c"
+ML_SPLIT_DIR     = SPLIT_ROOT / "ml"
+INTERP_SPLIT_DIR = SPLIT_ROOT / "interp"
+
+# How many rows to hold in memory at once while splitting the big CSVs.
+SPLIT_CHUNK_ROWS = 2_000_000
 
 for pass_name in settings.PASSES:
     (settings.FINAL_DIR / pass_name).mkdir(parents=True, exist_ok=True)
@@ -85,6 +96,11 @@ def file_id_from_path(pass_name: str, path: Path) -> str:
     return f"{pass_name}/{path.name}"
 
 
+def safe_fid(fid: str) -> str:
+    """Turn a file_id like 'am/foo_20200101.csv' into a flat filename."""
+    return fid.replace("/", "__").replace("\\", "__")
+
+
 def list_complete_files() -> list[tuple[str, Path]]:
     files: list[tuple[str, Path]] = []
     for pass_name in settings.PASSES:
@@ -126,45 +142,141 @@ def pred_col_name(method: str) -> str:
     return f"pred_{method}"
 
 
-def read_ml_predictions() -> pd.DataFrame:
-    if not ML_PRED_PATH.exists():
-        print(f"Warning: ML prediction file not found: {ML_PRED_PATH}")
-        return pd.DataFrame(columns=["file_id", settings.KEY])
-    print(f"Reading ML predictions: {ML_PRED_PATH}")
-    df = pd.read_csv(ML_PRED_PATH)
-    needed = {"file_id", settings.KEY, "model", "prediction"}
-    if needed - set(df.columns):
-        raise ValueError(f"ML prediction file missing: {needed - set(df.columns)}")
-    df["prediction"] = pd.to_numeric(df["prediction"], errors="coerce")
-    wide = df.pivot_table(index=["file_id", settings.KEY], columns="model", values="prediction", aggfunc="first").reset_index()
-    wide.columns.name = None
-    return wide.rename(columns={c: pred_col_name(c) for c in wide.columns if c not in {"file_id", settings.KEY}})
+# ============================================================
+# SPLIT BIG PREDICTION CSVs INTO PER-FILE PIECES (streaming)
+# ============================================================
+
+def _split_one(src_path: Path, out_dir: Path, required_cols: list[str],
+               optional_cols: list[str], label: str) -> int:
+    """
+    Stream src_path in chunks and append each file_id's rows to its own
+    small CSV under out_dir. Keeps only one chunk in memory at a time.
+    Returns number of per-file CSVs written.
+    """
+    # Fresh output dir every run.
+    if out_dir.exists():
+        shutil.rmtree(out_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    if not src_path.exists():
+        print(f"Warning: {label} prediction file not found: {src_path}")
+        return 0
+
+    header = pd.read_csv(src_path, nrows=0)
+    missing = [c for c in required_cols if c not in header.columns]
+    if missing:
+        raise ValueError(f"{label} file missing required columns: {missing}")
+
+    usecols = list(required_cols) + [c for c in optional_cols if c in header.columns]
+
+    seen: set[str] = set()
+    total = 0
+    print(f"Splitting {label} predictions by file_id from {src_path} ...")
+    for chunk in pd.read_csv(src_path, usecols=usecols,
+                             chunksize=SPLIT_CHUNK_ROWS, low_memory=False):
+        total += len(chunk)
+        for fid, g in chunk.groupby("file_id", sort=False):
+            sp = out_dir / (safe_fid(str(fid)) + ".csv")
+            write_header = sp.name not in seen
+            g.to_csv(sp, mode="a", header=write_header, index=False)
+            seen.add(sp.name)
+        print(f"  {label}: {total:,} rows processed, {len(seen):,} per-file CSVs so far")
+
+    print(f"{label}: split into {len(seen):,} per-file CSVs under {out_dir}")
+    return len(seen)
 
 
-def read_interpolation_predictions() -> pd.DataFrame:
-    if not INTERP_PRED_PATH.exists():
-        print(f"Warning: interpolation prediction file not found: {INTERP_PRED_PATH}")
-        return pd.DataFrame(columns=["file_id", settings.KEY])
-    print(f"Reading interpolation predictions: {INTERP_PRED_PATH}")
-    df = pd.read_csv(INTERP_PRED_PATH)
-    needed = {"file_id", settings.KEY, "method", "prediction"}
-    if needed - set(df.columns):
-        raise ValueError(f"Interpolation file missing: {needed - set(df.columns)}")
+def split_predictions_by_file() -> tuple[int, int]:
+    n_ml = _split_one(
+        ML_PRED_PATH, ML_SPLIT_DIR,
+        required_cols=["file_id", settings.KEY, "model", "prediction"],
+        optional_cols=[],
+        label="ML",
+    )
+    n_interp = _split_one(
+        INTERP_PRED_PATH, INTERP_SPLIT_DIR,
+        required_cols=["file_id", settings.KEY, "method", "prediction"],
+        optional_cols=["kriging_variance", "nearest_distance"],
+        label="Interpolation",
+    )
+    return n_ml, n_interp
+
+
+# ============================================================
+# PER-FILE PREDICTION READERS (small, in the main loop)
+# ============================================================
+
+def read_ml_for_file(fid: str) -> pd.DataFrame:
+    cols = ["file_id", settings.KEY] + [pred_col_name(m) for m in settings.ML_MODELS_TO_USE]
+    sp = ML_SPLIT_DIR / (safe_fid(fid) + ".csv")
+    if not sp.exists():
+        return pd.DataFrame(columns=cols)
+
+    df = pd.read_csv(sp)
+    if df.empty:
+        return pd.DataFrame(columns=cols)
+
     df["prediction"] = pd.to_numeric(df["prediction"], errors="coerce")
-    wide = df.pivot_table(index=["file_id", settings.KEY], columns="method", values="prediction", aggfunc="first").reset_index()
+    wide = df.pivot_table(index=["file_id", settings.KEY], columns="model",
+                          values="prediction", aggfunc="first", dropna=False).reset_index()
     wide.columns.name = None
-    out = wide.rename(columns={c: pred_col_name(c) for c in wide.columns if c not in {"file_id", settings.KEY}})
+    for m in settings.ML_MODELS_TO_USE:
+        if m not in wide.columns:
+            wide[m] = np.nan
+    wide = wide.rename(columns={c: pred_col_name(c)
+                                for c in wide.columns if c not in {"file_id", settings.KEY}})
+    for c in cols:
+        if c not in wide.columns:
+            wide[c] = np.nan
+    return wide[cols]
+
+
+def read_interp_for_file(fid: str) -> pd.DataFrame:
+    base_cols = ["file_id", settings.KEY] + \
+                [pred_col_name(m) for m in settings.INTERPOLATION_METHODS_TO_USE]
+    sp = INTERP_SPLIT_DIR / (safe_fid(fid) + ".csv")
+    if not sp.exists():
+        return pd.DataFrame(columns=base_cols)
+
+    df = pd.read_csv(sp)
+    if df.empty:
+        return pd.DataFrame(columns=base_cols)
+
+    df["prediction"] = pd.to_numeric(df["prediction"], errors="coerce")
+    wide = df.pivot_table(index=["file_id", settings.KEY], columns="method",
+                          values="prediction", aggfunc="first", dropna=False).reset_index()
+    wide.columns.name = None
+    for m in settings.INTERPOLATION_METHODS_TO_USE:
+        if m not in wide.columns:
+            wide[m] = np.nan
+    out = wide.rename(columns={c: pred_col_name(c)
+                               for c in wide.columns if c not in {"file_id", settings.KEY}})
 
     for method, diag_col, rename_col in [
         ("centroid_ordinary_kriging", "kriging_variance", "kriging_variance_centroid_ok"),
         ("nearest_neighbor_same_day", "nearest_distance", "nearest_distance_nn"),
     ]:
-        col = diag_col
-        if col in df.columns:
-            sub = df[df["method"].eq(method)][["file_id", settings.KEY, col]].rename(columns={col: rename_col})
+        if diag_col in df.columns:
+            sub = (df[df["method"].eq(method)][["file_id", settings.KEY, diag_col]]
+                   .rename(columns={diag_col: rename_col}))
             out = out.merge(sub, on=["file_id", settings.KEY], how="left")
+
+    for c in base_cols:
+        if c not in out.columns:
+            out[c] = np.nan
     return out
 
+
+def predictions_for_file(fid: str) -> pd.DataFrame:
+    ml     = read_ml_for_file(fid)
+    interp = read_interp_for_file(fid)
+    psub   = pd.merge(interp, ml, on=["file_id", settings.KEY], how="outer")
+    return psub
+
+
+# ============================================================
+# STACKING / WATERFALL
+# ============================================================
 
 def apply_waterfall(row: pd.Series, candidate_methods: list[str]) -> tuple[float, str]:
     for method in candidate_methods:
@@ -188,6 +300,15 @@ def apply_stacking_to_missing(missing_df, meta_model, waterfall_methods):
             if c not in X_meta.columns:
                 X_meta[c] = np.nan
         X_meta = X_meta[META_FEATURE_COLS].to_numpy(dtype=float)
+
+        # Training (10g) and inference (here) must share the same ordered
+        # feature contract, or the model silently mis-maps columns.
+        n_expected = getattr(meta_model, "n_features_in_", len(META_FEATURE_COLS))
+        if X_meta.shape[1] != n_expected:
+            raise ValueError(
+                f"Meta-model expects {n_expected} features but got {X_meta.shape[1]}. "
+                "Re-train 10g and run 11c with the same META_FEATURE_COLS / BASE_PRED_COLS."
+            )
 
         with warnings.catch_warnings():
             warnings.simplefilter("ignore")
@@ -224,7 +345,7 @@ def output_filename(input_path: Path) -> str:
 # ============================================================
 
 def main() -> None:
-    print("11c: Finalize SMAP gap-filled files (with stacking + regression_kriging)")
+    print("11c: Finalize SMAP gap-filled files (stacking + regression_kriging, memory-safe)")
     print("=" * 80)
     print(f"Stacking model: {'enabled' if META_MODEL is not None else 'disabled'}")
     print(f"Waterfall order: {[settings.FINAL_PRIMARY_METHOD] + list(settings.FINAL_FALLBACK_METHODS)}")
@@ -237,17 +358,11 @@ def main() -> None:
     for m in waterfall_methods:
         print(f"  - {m}")
 
-    ml_preds    = read_ml_predictions()
-    interp_preds = read_interpolation_predictions()
-    print(f"\nML rows:            {len(ml_preds):,}")
-    print(f"Interpolation rows: {len(interp_preds):,}")
-
-    preds = interp_preds if len(interp_preds) > 0 else pd.DataFrame(columns=["file_id", settings.KEY])
-    if len(ml_preds) > 0:
-        preds = preds.merge(ml_preds, on=["file_id", settings.KEY], how="outer")
-
-    pred_cols = [c for c in preds.columns if c.startswith("pred_")]
-    print(f"\nPrediction columns: {pred_cols}")
+    # --- Split the big prediction files ONCE into per-file pieces ---
+    print("\nPreparing per-file prediction index (streaming, low memory)...")
+    n_ml, n_interp = split_predictions_by_file()
+    print(f"\nPer-file ML prediction CSVs:            {n_ml:,}")
+    print(f"Per-file interpolation prediction CSVs: {n_interp:,}")
 
     files = list_complete_files()
     summary_rows = []
@@ -260,7 +375,9 @@ def main() -> None:
         df     = pd.read_csv(path, low_memory=False)
         df     = add_basic_columns(df, pass_name, path)
         fid    = file_id_from_path(pass_name, path)
-        psub   = preds[preds["file_id"].eq(fid)].copy()
+
+        # Only this day's predictions are read into memory.
+        psub   = predictions_for_file(fid)
         merged = df.merge(psub, on=["file_id", settings.KEY], how="left")
 
         is_missing     = merged[settings.TARGET].isna()
@@ -336,6 +453,13 @@ def main() -> None:
         "clip_filled_values": settings.CLIP_FILLED_VALUES,
     }
     pd.DataFrame([overall]).to_csv(OVERALL_SUMMARY_PATH, index=False)
+
+    # Clean up the temporary per-file split to reclaim disk.
+    try:
+        shutil.rmtree(SPLIT_ROOT)
+        print(f"\nCleaned temp split dir: {SPLIT_ROOT}")
+    except Exception as exc:
+        print(f"\nNote: could not remove temp split dir {SPLIT_ROOT} ({exc}).")
 
     print("\nSaved:", SUMMARY_BY_FILE_PATH)
     print("Saved:", OVERALL_SUMMARY_PATH)

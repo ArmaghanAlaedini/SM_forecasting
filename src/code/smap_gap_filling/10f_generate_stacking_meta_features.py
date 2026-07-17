@@ -96,9 +96,14 @@ def load_ml_predictions() -> pd.DataFrame:
 
     wide = df.pivot_table(
         index=["date", "pass", KEY], columns="model",
-        values="prediction", aggfunc="first",
+        values="prediction", aggfunc="first", dropna=False,
     ).reset_index()
     wide.columns.name = None
+    # Guarantee every expected model column exists even if entirely empty,
+    # so a missing base model never silently vanishes from the meta table.
+    for m in ML_MODELS_TO_STACK:
+        if m not in wide.columns:
+            wide[m] = np.nan
     wide = wide.rename(columns={m: f"pred_{m}" for m in ML_MODELS_TO_STACK if m in wide.columns})
 
     first_model = ML_MODELS_TO_STACK[0]
@@ -142,9 +147,14 @@ def load_interp_predictions() -> pd.DataFrame:
 
     wide = df.pivot_table(
         index=["date", "pass", KEY], columns="method",
-        values="prediction", aggfunc="first",
+        values="prediction", aggfunc="first", dropna=False,
     ).reset_index()
     wide.columns.name = None
+    # Guarantee every expected method column exists even if entirely empty.
+    # This is the fix that stops regression_kriging from disappearing here.
+    for m in INTERP_METHODS_TO_STACK:
+        if m not in wide.columns:
+            wide[m] = np.nan
     wide = wide.rename(
         columns={m: f"pred_{m}" for m in INTERP_METHODS_TO_STACK if m in wide.columns}
     )
@@ -175,6 +185,14 @@ def build_meta_table(ml: pd.DataFrame, interp: pd.DataFrame) -> pd.DataFrame:
     n_before = len(meta)
     meta = meta[has_any].copy()
     print(f"  Rows with ≥1 base prediction: {len(meta):,}  (dropped {n_before - len(meta):,})")
+
+    # Per-method coverage: a near-empty base method (e.g. regression_kriging)
+    # is the symptom of an upstream silent failure. Make it visible.
+    print("\n  Base method coverage in meta table:")
+    for c in pred_cols_present:
+        frac = meta[c].notna().mean() if len(meta) else 0.0
+        flag = "   <-- LOW, check upstream stage" if frac < 0.05 else ""
+        print(f"    {c:<40} {frac*100:5.1f}%{flag}")
 
     id_cols  = ["date", "pass", KEY]
     cov_cols = [c for c in ["x", "y", "sin_doy", "cos_doy", "pass_pm"] if c in meta.columns]

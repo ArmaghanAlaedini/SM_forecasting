@@ -9,7 +9,7 @@
 #SBATCH --mem=32G
 #SBATCH --partition=nova
 
-export SMAP_PROJECT_ROOT=/work/estherjo/alaedini/projects/iem_pta_kriging
+export SMAP_PROJECT_ROOT=/work/estherjo/alaedini/projects/gap-filling
 cd $SMAP_PROJECT_ROOT
 mkdir -p logs
 

@@ -99,7 +99,7 @@ Typical actual plotted variables are:
 # ============================================================
 
 def load_config():
-    config_path = Path(__file__).resolve().with_name("00_config.py")
+    config_path = Path(__file__).resolve().parent.parent / "00_config.py"
 
     spec = importlib.util.spec_from_file_location("cfg", config_path)
     cfg = importlib.util.module_from_spec(spec)

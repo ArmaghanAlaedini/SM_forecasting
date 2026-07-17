@@ -50,7 +50,8 @@ MAX_LABEL_LEN = 55
 # ============================================================
 
 SCRIPT_DIR = Path(__file__).resolve().parent
-SETTINGS_PATH = SCRIPT_DIR / "11_gapfilling_setting.py"
+SETTINGS_PATH = SCRIPT_DIR.parent / "11_gapfilling_setting.py"
+
 
 if SETTINGS_PATH.exists():
     spec = importlib.util.spec_from_file_location("gapfill_settings", SETTINGS_PATH)

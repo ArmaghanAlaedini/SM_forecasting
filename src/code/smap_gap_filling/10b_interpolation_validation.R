@@ -23,6 +23,25 @@ suppressPackageStartupMessages({
   library(data.table)
 })
 
+# ------------------------------------------------------------
+# Fail loud if geostat packages are missing.
+# (Previously OK + RK were silently skipped when sf/gstat were
+#  absent, which is how regression_kriging disappeared on HPC.)
+# This script now uses the SAME backend as 11b: sp + gstat.
+# ------------------------------------------------------------
+.required <- c("sp", "gstat")
+.missing  <- .required[!vapply(.required, requireNamespace, logical(1),
+                               quietly = TRUE)]
+if (length(.missing) > 0) {
+  stop("Missing required R packages: ", paste(.missing, collapse = ", "),
+       "\nInstall them and re-run. Do NOT continue: interpolation ",
+       "methods (ordinary + regression kriging) would be silently skipped.")
+}
+suppressPackageStartupMessages({
+  library(sp)
+  library(gstat)
+})
+
 # ============================================================
 # USER SETTINGS
 # ============================================================
@@ -268,11 +287,6 @@ predict_nearest_neighbor <- function(eval_dt) {
 # ============================================================
 
 predict_centroid_ok <- function(eval_dt) {
-  if (!requireNamespace("sf", quietly = TRUE) ||
-      !requireNamespace("gstat", quietly = TRUE)) {
-    message("[skip] centroid_ok needs sf, gstat")
-    return(NULL)
-  }
   donors  <- eval_dt[eval_role == "donor"  & is.finite(x) & is.finite(y) & !is.na(get(TARGET))]
   targets <- eval_dt[eval_role == "target" & is.finite(x) & is.finite(y) & !is.na(get(TARGET))]
   if (nrow(donors) < 20 || nrow(targets) == 0) return(NULL)
@@ -294,21 +308,19 @@ predict_centroid_ok <- function(eval_dt) {
 
   donor_resid <- donor_z - donor_trend
 
-  donors_sf <- sf::st_as_sf(
-    data.frame(z = donor_resid, x = donor_x, y = donor_y),
-    coords = c("x", "y"), crs = CENTROID_OK_CRS, remove = FALSE
+  obs_sp <- sp::SpatialPointsDataFrame(
+    coords = cbind(donor_x, donor_y),
+    data   = data.frame(z = donor_resid)
   )
-  targets_sf <- sf::st_as_sf(
-    targets_df, coords = c("x", "y"), crs = CENTROID_OK_CRS, remove = FALSE
-  )
+  mis_sp <- sp::SpatialPoints(cbind(target_x, target_y))
 
   tryCatch({
-    vg_emp <- gstat::variogram(z ~ 1, donors_sf)
+    vg_emp <- gstat::variogram(z ~ 1, obs_sp)
     vg_fit <- tryCatch(
-      gstat::fit.variogram(vg_emp, gstat::vgm(stats::var(donors_sf$z, na.rm = TRUE), "Sph", 50000, 0.001)),
-      error = function(e) gstat::vgm(stats::var(donors_sf$z, na.rm = TRUE), "Sph", 50000, 0.001)
+      gstat::fit.variogram(vg_emp, gstat::vgm(stats::var(donor_resid, na.rm = TRUE), "Sph", 50000, 0.001)),
+      error = function(e) gstat::vgm(stats::var(donor_resid, na.rm = TRUE), "Sph", 50000, 0.001)
     )
-    kriged <- gstat::krige(z ~ 1, donors_sf, targets_sf, model = vg_fit,
+    kriged <- gstat::krige(z ~ 1, obs_sp, mis_sp, model = vg_fit,
                            nmax = CENTROID_OK_NMAX, debug.level = 0)
 
     # Add the spatial trend back
@@ -334,11 +346,6 @@ predict_centroid_ok <- function(eval_dt) {
 # ============================================================
 
 predict_regression_kriging <- function(eval_dt) {
-  if (!requireNamespace("sf", quietly = TRUE) ||
-      !requireNamespace("gstat", quietly = TRUE)) {
-    message("[skip] regression_kriging needs sf, gstat")
-    return(NULL)
-  }
   donors  <- eval_dt[eval_role == "donor"  & is.finite(x) & is.finite(y) & !is.na(get(TARGET))]
   targets <- eval_dt[eval_role == "target" & is.finite(x) & is.finite(y) & !is.na(get(TARGET))]
   if (nrow(donors) < 20 || nrow(targets) == 0) return(NULL)
@@ -372,14 +379,16 @@ predict_regression_kriging <- function(eval_dt) {
     obs_ok <- obs_df[is.finite(obs_df$rk_residual) & is.finite(obs_df$x) & is.finite(obs_df$y), ]
     if (nrow(obs_ok) < 5L) return(NULL)
 
-    obs_sp <- sf::st_as_sf(obs_ok, coords = c("x", "y"), crs = CENTROID_OK_CRS, remove = FALSE)
-    mis_sp <- sf::st_as_sf(mis_df, coords = c("x", "y"), crs = CENTROID_OK_CRS, remove = FALSE)
-    names(obs_sp)[names(obs_sp) == "rk_residual"] <- "z"
+    obs_sp <- sp::SpatialPointsDataFrame(
+      coords = cbind(obs_ok$x, obs_ok$y),
+      data   = data.frame(z = obs_ok$rk_residual)
+    )
+    mis_sp <- sp::SpatialPoints(cbind(mis_df$x, mis_df$y))
 
     vg_emp <- gstat::variogram(z ~ 1, obs_sp)
     vg_fit <- tryCatch(
-      gstat::fit.variogram(vg_emp, gstat::vgm(stats::var(obs_sp$z, na.rm = TRUE), "Sph", 50000, 0.001)),
-      error = function(e) gstat::vgm(stats::var(obs_sp$z, na.rm = TRUE), "Sph", 50000, 0.001)
+      gstat::fit.variogram(vg_emp, gstat::vgm(stats::var(obs_ok$rk_residual, na.rm = TRUE), "Sph", 50000, 0.001)),
+      error = function(e) gstat::vgm(stats::var(obs_ok$rk_residual, na.rm = TRUE), "Sph", 50000, 0.001)
     )
     kriged <- gstat::krige(z ~ 1, obs_sp, mis_sp, model = vg_fit, nmax = CENTROID_OK_NMAX, debug.level = 0)
 

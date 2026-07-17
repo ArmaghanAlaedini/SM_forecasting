@@ -1,8 +1,8 @@
 #!/bin/bash
-#SBATCH --job-name=interp_val
-#SBATCH --output=logs/10b_interp_validation_%j.out
-#SBATCH --error=logs/10b_interp_validation_%j.err
-#SBATCH --time=08:00:00
+#SBATCH --job-name=smap_lattice
+#SBATCH --output=logs/01_smap_lattice_%j.out
+#SBATCH --error=logs/01_smap_lattice_%j.err
+#SBATCH --time=02:00:00
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=4
@@ -17,9 +17,8 @@ module purge
 module load micromamba
 export MAMBA_ROOT_PREFIX=/work/estherjo/alaedini/micromamba
 eval "$(micromamba shell hook --shell=bash)"
-micromamba activate smap_r
-export RENV_CONFIG_AUTOLOADER_ENABLED=FALSE
+micromamba activate smap_pta
 
-echo "Starting 10b_interpolation_validation.R at $(date)"
-Rscript src/code/smap_gap_filling/10b_interpolation_validation.R
+echo "Starting 01_smap_lattice.py at $(date)"
+python src/code/smap_gap_filling/01_smap_lattice.py
 echo "Done at $(date)"
