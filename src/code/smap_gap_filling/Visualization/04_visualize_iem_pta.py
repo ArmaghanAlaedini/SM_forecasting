@@ -1,347 +1,188 @@
-from pathlib import Path
-import importlib.util
-import re
+#!/usr/bin/env python3
+"""Visualize daily IEM point-to-area outputs on the SMAP lattice.
 
-import pandas as pd
+The script reads the exact daily file names created by ``03_iem_pta_kriging.py``
+and writes figures to ``09_final_visualization/02_iem_pta``.
+"""
+
+from __future__ import annotations
+
+import argparse
+from pathlib import Path
+
 import geopandas as gpd
 import matplotlib
-
-# Use non-interactive backend so this also works on HPC.
 matplotlib.use("Agg")
-
 import matplotlib.pyplot as plt
-
-
-# ============================================================
-# 0. Load config
-# ============================================================
-
-def load_config():
-    """Load 00_config.py even though the filename starts with a number."""
-    config_path = Path(__file__).resolve().parent.parent / "00_config.py"
-
-    spec = importlib.util.spec_from_file_location("cfg", config_path)
-    cfg = importlib.util.module_from_spec(spec)
-
-    if spec.loader is None:
-        raise ImportError(f"Could not load config from {config_path}")
-
-    spec.loader.exec_module(cfg)
-    return cfg
-
-
-cfg = load_config()
-
-
-# ============================================================
-# 1. Settings
-# ============================================================
-
-# Folder containing daily PTA CSV files.
-PTA_DIR = cfg.IEM_PTA_DIR
-
-# Output folder for maps.
-FIG_DIR = PTA_DIR / "figures"
-FIG_DIR.mkdir(parents=True, exist_ok=True)
-
-# Choose a few dates to visualize.
-# Use YYYY-MM-DD format.
-SELECT_DATES = [
-    "2020-01-01",
-    "2020-07-01",
-    "2025-07-01",
-]
-
-# Choose variables to visualize.
-# These should match columns in the daily PTA CSV files.
-SELECT_VARIABLES = [
-    "precip_pta",
-    "et_pta",
-    "soil12vwc_pta",
-    "soil24vwc_pta",
-]
-
-# If True, use the same color scale across selected dates
-# for the same variable.
-USE_SHARED_SCALE_ACROSS_DATES = True
-
-
-# ============================================================
-# 2. File helpers
-# ============================================================
-
-def list_pta_files() -> list[Path]:
-    """List daily PTA CSV files."""
-    files = sorted(PTA_DIR.glob("iem_pta_smap_lattice_*.csv"))
-
-    if not files:
-        raise FileNotFoundError(f"No daily PTA CSV files found in:\n{PTA_DIR}")
-
-    return files
-
-
-def date_to_yyyymmdd(date_string: str) -> str:
-    """Convert YYYY-MM-DD to YYYYMMDD."""
-    return pd.to_datetime(date_string).strftime("%Y%m%d")
-
-
-def extract_date_from_file(path: Path) -> str:
-    """Extract date from filename as YYYY-MM-DD."""
-    match = re.search(r"iem_pta_smap_lattice_(\d{8})\.csv", path.name)
-
-    if match is None:
-        raise ValueError(f"Could not extract date from filename: {path.name}")
-
-    return pd.to_datetime(match.group(1), format="%Y%m%d").strftime("%Y-%m-%d")
-
-
-def get_files_for_selected_dates(files: list[Path], selected_dates: list[str]) -> list[Path]:
-    """Return files matching selected dates."""
-    file_map = {
-        extract_date_from_file(path): path
-        for path in files
-    }
-
-    selected_files = []
-
-    for date_string in selected_dates:
-        date_string = pd.to_datetime(date_string).strftime("%Y-%m-%d")
-
-        if date_string in file_map:
-            selected_files.append(file_map[date_string])
-        else:
-            print(f"Warning: no PTA file found for {date_string}")
-
-    if not selected_files:
-        print("No selected dates were found. Falling back to first 3 available files.")
-        selected_files = files[:3]
-
-    return selected_files
-
-
-# ============================================================
-# 3. Load daily PTA file
-# ============================================================
-
-def load_pta_csv(path: Path) -> gpd.GeoDataFrame:
-    """
-    Load one daily PTA CSV and convert geometry_wkt to geometry.
-    """
-    df = pd.read_csv(path)
-
-    if "geometry_wkt" not in df.columns:
-        raise ValueError(f"File has no geometry_wkt column:\n{path}")
-
-    geometry = gpd.GeoSeries.from_wkt(df["geometry_wkt"], crs=f"EPSG:{cfg.CRS_EASE}")
-
-    gdf = gpd.GeoDataFrame(
-        df.drop(columns=["geometry_wkt"]),
-        geometry=geometry,
-        crs=f"EPSG:{cfg.CRS_EASE}",
-    )
-
-    return gdf
-
-
-# ============================================================
-# 4. Plot helpers
-# ============================================================
-
-def clean_axis(ax, title: str) -> None:
-    """Apply clean map formatting."""
-    ax.set_title(title, fontsize=11, pad=8)
-    ax.set_axis_off()
-    ax.set_aspect("equal")
-
-
-def save_pdf(fig, filename: str) -> None:
-    """Save figure as PDF."""
-    out_path = FIG_DIR / filename
-    fig.savefig(out_path, bbox_inches="tight")
-    plt.close(fig)
-    print(f"Saved: {out_path}")
-
-
-def available_variables(gdf: gpd.GeoDataFrame, requested_vars: list[str]) -> list[str]:
-    """Keep only variables that exist in the data."""
-    existing = []
-
-    for var in requested_vars:
-        if var in gdf.columns:
-            existing.append(var)
-        else:
-            print(f"Warning: variable not found and skipped: {var}")
-
-    return existing
-
-
-# ============================================================
-# 5. Figure A: multiple variables for one date
-# ============================================================
-
-def plot_variables_for_one_date(path: Path, variables: list[str]) -> None:
-    """
-    Plot several PTA variables for one date.
-    """
-    date_string = extract_date_from_file(path)
-    gdf = load_pta_csv(path)
-
-    variables = available_variables(gdf, variables)
-
-    if not variables:
-        print(f"No requested variables available for {date_string}. Skipping.")
-        return
-
-    n = len(variables)
-
-    fig, axes = plt.subplots(
-        1,
-        n,
-        figsize=(4.2 * n, 5.0),
-        constrained_layout=True,
-    )
-
-    if n == 1:
-        axes = [axes]
-
-    for ax, var in zip(axes, variables):
-        gdf.plot(
-            column=var,
-            ax=ax,
-            legend=True,
-            linewidth=0.0,
-            cmap="viridis",
-            missing_kwds={
-                "color": "lightgray",
-                "label": "Missing",
-            },
-        )
-
-        clean_axis(ax, var)
-
-    fig.suptitle(f"IEM PTA Kriged Variables on SMAP Lattice — {date_string}", fontsize=14)
-
-    save_pdf(fig, f"pta_variables_{date_to_yyyymmdd(date_string)}.pdf")
-
-
-# ============================================================
-# 6. Figure B: one variable across multiple dates
-# ============================================================
-
-def plot_one_variable_across_dates(paths: list[Path], variable: str) -> None:
-    """
-    Plot one variable for multiple dates side by side.
-
-    This is useful for checking whether daily maps change sensibly.
-    """
-    gdfs = []
-    dates = []
-
-    for path in paths:
-        gdf = load_pta_csv(path)
-        date_string = extract_date_from_file(path)
-
-        if variable not in gdf.columns:
-            print(f"Warning: {variable} not found in {path.name}. Skipping.")
+from matplotlib.cm import ScalarMappable
+from matplotlib.colors import Normalize
+import pandas as pd
+
+from visualization_common import (
+    VISUALIZATION_ROOT,
+    iem_pta_file_path,
+    normalize_date,
+    ordered_pta_columns,
+    pretty_variable,
+    read_spatial_csv,
+    read_townships,
+    robust_limits,
+    safe_name,
+    save_figure,
+    variable_unit,
+)
+
+
+DEFAULT_DATES = ["2020-01-01", "2020-07-01", "2025-07-01"]
+DEFAULT_VARIABLES = ["precip_pta", "et_pta", "soil12vwc_pta", "soil24vwc_pta"]
+OUT_DIR = VISUALIZATION_ROOT / "02_iem_pta"
+OUT_DIR.mkdir(parents=True, exist_ok=True)
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--dates", nargs="+", default=DEFAULT_DATES)
+    parser.add_argument("--variables", nargs="+", default=DEFAULT_VARIABLES)
+    parser.add_argument("--all-variables", action="store_true")
+    parser.add_argument("--no-townships", action="store_true")
+    return parser.parse_args()
+
+
+def load_days(dates: list[str]) -> dict[str, gpd.GeoDataFrame]:
+    records: dict[str, gpd.GeoDataFrame] = {}
+    for raw_date in dates:
+        date = normalize_date(raw_date)
+        path = iem_pta_file_path(date)
+        if not path.exists():
+            print(f"[warning] PTA file not found for {date}: {path}")
             continue
+        _, gdf = read_spatial_csv(path)
+        if gdf is None:
+            raise ValueError(f"PTA file must contain geometry_wkt: {path}")
+        records[date] = gdf
+        print(f"[loaded] {date}: {path.name}")
+    if not records:
+        raise FileNotFoundError("None of the requested IEM PTA daily files were found.")
+    return records
 
-        gdfs.append(gdf)
-        dates.append(date_string)
 
-    if not gdfs:
-        print(f"No files contained {variable}. Skipping.")
+def add_boundary(ax, townships: gpd.GeoDataFrame | None) -> None:
+    if townships is not None:
+        townships.boundary.plot(ax=ax, color="0.35", linewidth=0.22, alpha=0.75)
+
+
+def plot_variables_for_date(
+    date: str,
+    gdf: gpd.GeoDataFrame,
+    variables: list[str],
+    limits: dict[str, tuple[float | None, float | None]],
+    townships: gpd.GeoDataFrame | None,
+) -> None:
+    variables = [variable for variable in variables if variable in gdf.columns]
+    if not variables:
         return
-
-    if USE_SHARED_SCALE_ACROSS_DATES:
-        values = pd.concat([gdf[variable] for gdf in gdfs], ignore_index=True)
-        vmin = values.quantile(0.02)
-        vmax = values.quantile(0.98)
-    else:
-        vmin = None
-        vmax = None
-
-    n = len(gdfs)
-
+    ncols = min(3, len(variables))
+    nrows = (len(variables) + ncols - 1) // ncols
     fig, axes = plt.subplots(
-        1,
-        n,
-        figsize=(4.2 * n, 5.0),
-        constrained_layout=True,
+        nrows, ncols, figsize=(5.0 * ncols, 4.6 * nrows), constrained_layout=True
     )
+    axes_list = list(axes.flat) if hasattr(axes, "flat") else [axes]
 
-    if n == 1:
-        axes = [axes]
-
-    for ax, gdf, date_string in zip(axes, gdfs, dates):
+    for ax, variable in zip(axes_list, variables):
+        vmin, vmax = limits[variable]
         gdf.plot(
             column=variable,
             ax=ax,
-            legend=True,
-            linewidth=0.0,
             cmap="viridis",
             vmin=vmin,
             vmax=vmax,
-            missing_kwds={
-                "color": "lightgray",
-                "label": "Missing",
-            },
+            linewidth=0,
+            missing_kwds={"color": "0.82"},
         )
+        add_boundary(ax, townships)
+        ax.set_axis_off()
+        ax.set_aspect("equal")
+        ax.set_title(pretty_variable(variable), fontsize=11)
+        if vmin is not None and vmax is not None:
+            mappable = ScalarMappable(norm=Normalize(vmin=vmin, vmax=vmax), cmap="viridis")
+            label = variable_unit(variable)
+            cbar = fig.colorbar(mappable, ax=ax, shrink=0.72, pad=0.015)
+            if label:
+                cbar.set_label(label)
 
-        clean_axis(ax, date_string)
+    for ax in axes_list[len(variables):]:
+        ax.set_visible(False)
 
-    fig.suptitle(f"{variable} Across Selected Dates", fontsize=14)
-
-    save_pdf(fig, f"pta_{variable}_across_dates.pdf")
-
-
-# ============================================================
-# 7. Quick summary
-# ============================================================
-
-def print_file_summary(path: Path) -> None:
-    """
-    Print basic information for one daily PTA file.
-    """
-    gdf = load_pta_csv(path)
-    date_string = extract_date_from_file(path)
-
-    pta_cols = [c for c in gdf.columns if c.endswith("_pta")]
-
-    print("\nDaily PTA file summary")
-    print("-" * 60)
-    print(f"Date:       {date_string}")
-    print(f"File:       {path.name}")
-    print(f"Rows:       {len(gdf)}")
-    print(f"CRS:        {gdf.crs}")
-    print(f"PTA cols:   {pta_cols}")
-    print("-" * 60)
+    fig.suptitle(f"IEM variables translated to SMAP support — {date}", fontsize=14)
+    save_figure(fig, OUT_DIR / f"iem_pta_variables_{date.replace('-', '')}")
 
 
-# ============================================================
-# 8. Main
-# ============================================================
+def plot_variable_across_dates(
+    variable: str,
+    records: dict[str, gpd.GeoDataFrame],
+    limits: tuple[float | None, float | None],
+    townships: gpd.GeoDataFrame | None,
+) -> None:
+    available = [(date, gdf) for date, gdf in records.items() if variable in gdf.columns]
+    if not available:
+        return
+    fig, axes = plt.subplots(
+        1, len(available), figsize=(4.8 * len(available), 4.9), constrained_layout=True
+    )
+    axes_list = list(axes) if hasattr(axes, "__len__") else [axes]
+    vmin, vmax = limits
+    for ax, (date, gdf) in zip(axes_list, available):
+        gdf.plot(
+            column=variable,
+            ax=ax,
+            cmap="viridis",
+            vmin=vmin,
+            vmax=vmax,
+            linewidth=0,
+            missing_kwds={"color": "0.82"},
+        )
+        add_boundary(ax, townships)
+        ax.set_axis_off()
+        ax.set_aspect("equal")
+        ax.set_title(date)
+
+    if vmin is not None and vmax is not None:
+        mappable = ScalarMappable(norm=Normalize(vmin=vmin, vmax=vmax), cmap="viridis")
+        cbar = fig.colorbar(mappable, ax=axes_list, shrink=0.72, pad=0.015)
+        unit = variable_unit(variable)
+        if unit:
+            cbar.set_label(unit)
+    fig.suptitle(pretty_variable(variable), fontsize=14)
+    save_figure(fig, OUT_DIR / f"iem_pta_{safe_name(variable)}_across_dates")
+
 
 def main() -> None:
-    files = list_pta_files()
-    selected_files = get_files_for_selected_dates(files, SELECT_DATES)
+    args = parse_args()
+    records = load_days(args.dates)
+    first = next(iter(records.values()))
+    variables = ordered_pta_columns(first.columns) if args.all_variables else args.variables
+    variables = [variable for variable in variables if any(variable in gdf for gdf in records.values())]
+    if not variables:
+        raise ValueError("None of the requested variables are present in the PTA files.")
 
-    print(f"PTA folder: {PTA_DIR}")
-    print(f"Figure folder: {FIG_DIR}")
-    print(f"Daily files found: {len(files)}")
-    print(f"Selected files: {[p.name for p in selected_files]}")
+    limits = {
+        variable: robust_limits(
+            [gdf[variable] for gdf in records.values() if variable in gdf.columns]
+        )
+        for variable in variables
+    }
+    townships = None if args.no_townships else read_townships(first.crs)
 
-    # Print one file summary.
-    print_file_summary(selected_files[0])
+    print("04: Visualize IEM PTA outputs")
+    print(f"Dates:     {list(records)}")
+    print(f"Variables: {variables}")
+    print(f"Output:    {OUT_DIR}")
 
-    # Plot multiple variables for each selected date.
-    for path in selected_files:
-        plot_variables_for_one_date(path, SELECT_VARIABLES)
-
-    # Plot each selected variable across dates.
-    for variable in SELECT_VARIABLES:
-        plot_one_variable_across_dates(selected_files, variable)
-
-    print("\nDone.")
+    for date, gdf in records.items():
+        plot_variables_for_date(date, gdf, variables, limits, townships)
+    for variable in variables:
+        plot_variable_across_dates(variable, records, limits[variable], townships)
+    print("Done.")
 
 
 if __name__ == "__main__":

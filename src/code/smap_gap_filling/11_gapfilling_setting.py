@@ -1,133 +1,45 @@
 #!/usr/bin/env python3
-"""
-11_gapfilling_setting.py
+"""Compatibility settings for the 11-family production scripts.
 
-Manual settings for the 11-family SMAP gap-filling scripts.
+The authoritative settings now live in ``00_config.py``.  This wrapper keeps
+older imports working while preventing validation/test/production drift.
 """
 
+from __future__ import annotations
+
+import importlib.util
 from pathlib import Path
 
 
-# ============================================================
-# PROJECT PATHS
-# ============================================================
+CONFIG_PATH = Path(__file__).resolve().with_name("00_config.py")
+spec = importlib.util.spec_from_file_location("cfg", CONFIG_PATH)
+if spec is None or spec.loader is None:
+    raise ImportError(f"Could not load configuration from {CONFIG_PATH}")
+cfg = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(cfg)
 
-PROJECT_ROOT = Path(__file__).resolve().parents[3]
+PROJECT_ROOT = cfg.PROJECT_ROOT
+INPUT_DIR = cfg.FULL_SMAP_IEM_DIR
+PREDICTION_DIR = cfg.PREDICTION_DIR
+FINAL_DIR = cfg.FINAL_DIR
+META_MODEL_PATH = cfg.META_MODEL_PATH
 
-INPUT_DIR = (
-    PROJECT_ROOT
-    / "src/data/processed/smap_gap_filling/03_full_smap_iem_data"
-)
+TARGET = cfg.TARGET
+KEY = cfg.KEY
+PASSES = cfg.PASSES
 
-PREDICTION_DIR = (
-    PROJECT_ROOT
-    / "src/data/processed/smap_gap_filling/07_gapfill_predictions"
-)
+ML_TRAIN_YEARS = cfg.TRAIN_YEARS
+GAPFILL_YEARS = cfg.GAPFILL_YEARS
+ML_MODELS_TO_USE = cfg.SELECTED_ML_MODELS
+ML_FEATURE_GROUP_NAME = cfg.FINAL_ML_FEATURE_GROUP
+ML_FEATURES_TO_USE = cfg.FINAL_ML_FEATURES
+STRICT_ML_FEATURES = cfg.STRICT_FINAL_ML_FEATURES
+MAX_ML_TRAIN_ROWS = cfg.MAX_ML_TRAIN_ROWS
+RANDOM_STATE = cfg.RANDOM_SEED
 
-FINAL_DIR = (
-    PROJECT_ROOT
-    / "src/data/processed/smap_gap_filling/08_gapfilled_final"
-)
-
-META_MODEL_PATH = (
-    PROJECT_ROOT
-    / "src/data/processed/smap_gap_filling"
-    / "05_gapfill_model_validation/stacking/meta_model.joblib"
-)
-
-
-# ============================================================
-# BASIC COLUMNS
-# ============================================================
-
-TARGET = "soil_moisture"
-KEY = "smap_pixel_key"
-PASSES = ["am", "pm"]
-
-
-# ============================================================
-# YEARS
-# ============================================================
-
-ML_TRAIN_YEARS = [2020, 2021, 2022, 2023]
-GAPFILL_YEARS  = [2020, 2021, 2022, 2023, 2024, 2025]
-
-
-# ============================================================
-# ML MODEL SELECTION
-# ============================================================
-
-ML_MODELS_TO_USE = [
-    "xgboost",
-    "hist_gbdt",
-    "random_forest",
-]
-
-
-# ============================================================
-# ML FEATURE SELECTION
-# ============================================================
-
-ML_FEATURE_GROUP_NAME = "available_all_iem_spatiotemporal"
-
-ML_FEATURES_TO_USE = [
-    "precip_pta",
-    "rh_pta",
-    "speed_pta",
-    "gust_pta",
-    "et_pta",
-    "soil04tn_pta",
-    "soil04t_pta",
-    "soil04tx_pta",
-    "soil24tn_pta",
-    "soil24t_pta",
-    "soil24tx_pta",
-    "soil50tn_pta",
-    "soil50t_pta",
-    "soil50tx_pta",
-    "x",
-    "y",
-    "sin_doy",
-    "cos_doy",
-    "pass_pm",
-]
-
-STRICT_ML_FEATURES = False
-
-
-# ============================================================
-# TRAINING SIZE CONTROL
-# ============================================================
-
-MAX_ML_TRAIN_ROWS = 250_000
-RANDOM_STATE = 42
-
-
-# ============================================================
-# INTERPOLATION METHOD SELECTION
-# ============================================================
-
-INTERPOLATION_METHODS_TO_USE = [
-    "centroid_ordinary_kriging",
-    "nearest_neighbor_same_day",
-    "regression_kriging",
-]
-
-
-# ============================================================
-# FINAL FILLING RULE
-# ============================================================
-
-FINAL_PRIMARY_METHOD = "centroid_ordinary_kriging"
-
-FINAL_FALLBACK_METHODS = [
-    "nearest_neighbor_same_day",
-    "regression_kriging",
-    "xgboost",
-    "hist_gbdt",
-    "random_forest",
-]
-
-CLIP_FILLED_VALUES = False
-CLIP_MIN = 0.0
-CLIP_MAX = 0.7
+INTERPOLATION_METHODS_TO_USE = cfg.SELECTED_INTERPOLATION_METHODS
+FINAL_PRIMARY_METHOD = cfg.FINAL_PRIMARY_METHOD
+FINAL_FALLBACK_METHODS = cfg.FINAL_FALLBACK_METHODS
+CLIP_FILLED_VALUES = cfg.CLIP_FILLED_VALUES
+CLIP_MIN = cfg.CLIP_MIN
+CLIP_MAX = cfg.CLIP_MAX

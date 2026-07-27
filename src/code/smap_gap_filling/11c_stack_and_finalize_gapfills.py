@@ -1,476 +1,413 @@
 #!/usr/bin/env python3
-"""
-11c_stack_and_finalize_gapfills.py
--- updated to include pred_regression_kriging in META_FEATURE_COLS --
--- MEMORY-SAFE: prediction files are split once into per-file pieces and read
-   one day at a time, instead of loading the whole 12GB+1.4GB into RAM. --
+"""Create final gap-filled daily SMAP files from aligned base predictions.
+
+A ridge-stacking prediction is used only when all six required base predictions
+and all context features are finite.  Incomplete rows are sent to the explicit
+fallback waterfall; missing base predictions are never median-imputed.
+
+The large ML/GI prediction CSVs are streamed once into temporary per-file
+pieces, then only one retrieval is held in memory at a time.
 """
 
 from __future__ import annotations
-import importlib.util
-import re
+
 import shutil
-import warnings
 from pathlib import Path
+
+import joblib
 import numpy as np
 import pandas as pd
 
-SETTINGS_PATH = Path(__file__).resolve().parent / "11_gapfilling_setting.py"
-spec = importlib.util.spec_from_file_location("gapfill_settings", SETTINGS_PATH)
-settings = importlib.util.module_from_spec(spec)
-if spec.loader is None:
-    raise ImportError(f"Could not load settings file: {SETTINGS_PATH}")
-spec.loader.exec_module(settings)
+from gapfill_workflow_common import (
+    add_basic_columns,
+    cfg,
+    file_id_from_path,
+    list_complete_files,
+    parse_date_from_filename,
+)
 
 
-# ============================================================
-# PATHS
-# ============================================================
+ML_PREDICTION_PATH = cfg.PREDICTION_DIR / "ml" / "ml_gapfill_predictions.csv"
+GI_PREDICTION_PATH = (
+    cfg.PREDICTION_DIR / "interpolation" / "interpolation_gapfill_predictions.csv"
+)
+SUMMARY_BY_FILE_PATH = cfg.FINAL_DIR / "gapfill_summary_by_file.csv"
+OVERALL_SUMMARY_PATH = cfg.FINAL_DIR / "gapfill_overall_summary.csv"
 
-ML_PRED_PATH     = settings.PREDICTION_DIR / "ml/ml_gapfill_predictions.csv"
-INTERP_PRED_PATH = settings.PREDICTION_DIR / "interpolation/interpolation_gapfill_predictions.csv"
-SUMMARY_BY_FILE_PATH = settings.FINAL_DIR / "gapfill_summary_by_file.csv"
-OVERALL_SUMMARY_PATH = settings.FINAL_DIR / "gapfill_overall_summary.csv"
-
-# Temp location for the per-file split of the (huge) prediction CSVs.
-SPLIT_ROOT       = settings.PREDICTION_DIR / "_split_by_file_11c"
-ML_SPLIT_DIR     = SPLIT_ROOT / "ml"
-INTERP_SPLIT_DIR = SPLIT_ROOT / "interp"
-
-# How many rows to hold in memory at once while splitting the big CSVs.
+SPLIT_ROOT = cfg.PREDICTION_DIR / "_split_by_file_11c"
+ML_SPLIT_DIR = SPLIT_ROOT / "ml"
+GI_SPLIT_DIR = SPLIT_ROOT / "interpolation"
 SPLIT_CHUNK_ROWS = 2_000_000
 
-for pass_name in settings.PASSES:
-    (settings.FINAL_DIR / pass_name).mkdir(parents=True, exist_ok=True)
+for pass_name in cfg.PASSES:
+    (cfg.FINAL_DIR / pass_name).mkdir(parents=True, exist_ok=True)
 
 
-# ============================================================
-# STACKING META-MODEL
-# ============================================================
-
-def load_meta_model():
-    path = getattr(settings, "META_MODEL_PATH", None)
-    if path is None:
-        print("META_MODEL_PATH not set — using waterfall fill only.")
-        return None
-    path = Path(path)
-    if not path.exists():
-        print(f"Warning: meta-model not found at {path}. Using waterfall.")
-        return None
-    try:
-        import joblib
-        model = joblib.load(path)
-        print(f"Stacking meta-model loaded: {path}")
-        return model
-    except Exception as exc:
-        print(f"Warning: could not load meta-model ({exc}). Using waterfall.")
-        return None
+def safe_file_id(file_id: str) -> str:
+    return str(file_id).replace("/", "__").replace("\\", "__")
 
 
-META_MODEL = load_meta_model()
-
-# ← regression_kriging added here
-META_FEATURE_COLS = [
-    "pred_centroid_ordinary_kriging",
-    "pred_nearest_neighbor_same_day",
-    "pred_regression_kriging",
-    "pred_xgboost",
-    "pred_hist_gbdt",
-    "pred_random_forest",
-    "x", "y", "sin_doy", "cos_doy", "pass_pm",
-]
-
-
-# ============================================================
-# HELPERS
-# ============================================================
-
-def parse_date_from_filename(path: Path) -> pd.Timestamp:
-    match = re.search(r"(\d{8})", path.name)
-    if not match:
-        raise ValueError(f"Could not parse YYYYMMDD from: {path}")
-    return pd.to_datetime(match.group(1), format="%Y%m%d")
-
-
-def file_id_from_path(pass_name: str, path: Path) -> str:
-    return f"{pass_name}/{path.name}"
-
-
-def safe_fid(fid: str) -> str:
-    """Turn a file_id like 'am/foo_20200101.csv' into a flat filename."""
-    return fid.replace("/", "__").replace("\\", "__")
-
-
-def list_complete_files() -> list[tuple[str, Path]]:
-    files: list[tuple[str, Path]] = []
-    for pass_name in settings.PASSES:
-        folder = settings.INPUT_DIR / pass_name / "complete"
-        if not folder.exists():
-            raise FileNotFoundError(f"Missing input folder: {folder}")
-        for path in sorted(folder.glob("*.csv")):
-            files.append((pass_name, path))
-    if not files:
-        raise FileNotFoundError(f"No complete CSV files under {settings.INPUT_DIR}")
-    return files
-
-
-def add_basic_columns(df: pd.DataFrame, pass_name: str, path: Path) -> pd.DataFrame:
-    out = df.loc[:, ~df.columns.duplicated()].copy()
-    if "date" in out.columns:
-        out["date"] = pd.to_datetime(out["date"], errors="coerce")
-    else:
-        out["date"] = parse_date_from_filename(path)
-    out["year"]    = out["date"].dt.year
-    out["pass"]    = pass_name
-    out["file_id"] = file_id_from_path(pass_name, path)
-
-    doy = out["date"].dt.dayofyear.fillna(1).astype(float)
-    out["sin_doy"] = np.sin(2.0 * np.pi * doy / 366.0)
-    out["cos_doy"] = np.cos(2.0 * np.pi * doy / 366.0)
-    out["pass_pm"] = (pass_name.lower() == "pm")
-
-    if settings.KEY not in out.columns:
-        if {"grid_row", "grid_col"}.issubset(out.columns):
-            out[settings.KEY] = out["grid_row"].astype(str) + "_" + out["grid_col"].astype(str)
-        else:
-            out[settings.KEY] = np.arange(len(out)).astype(str)
-    out[settings.KEY] = out[settings.KEY].astype(str)
-    return out
-
-
-def pred_col_name(method: str) -> str:
+def prediction_column(method: str) -> str:
     return f"pred_{method}"
 
 
-# ============================================================
-# SPLIT BIG PREDICTION CSVs INTO PER-FILE PIECES (streaming)
-# ============================================================
+def load_meta_bundle() -> dict | None:
+    if not cfg.META_MODEL_PATH.exists():
+        print(f"Meta-model not found: {cfg.META_MODEL_PATH}; using fallbacks only.")
+        return None
+    bundle = joblib.load(cfg.META_MODEL_PATH)
+    if not isinstance(bundle, dict) or "pipeline" not in bundle:
+        raise ValueError(
+            "Saved meta-model has the old format. Re-run 10f and 10g with the fixed scripts."
+        )
+    if bundle.get("feature_columns") != list(cfg.META_FEATURE_COLUMNS):
+        raise ValueError(
+            "Saved meta-model feature order differs from 00_config.py. "
+            "Re-run 10f and 10g."
+        )
+    return bundle
 
-def _split_one(src_path: Path, out_dir: Path, required_cols: list[str],
-               optional_cols: list[str], label: str) -> int:
-    """
-    Stream src_path in chunks and append each file_id's rows to its own
-    small CSV under out_dir. Keeps only one chunk in memory at a time.
-    Returns number of per-file CSVs written.
-    """
-    # Fresh output dir every run.
-    if out_dir.exists():
-        shutil.rmtree(out_dir)
-    out_dir.mkdir(parents=True, exist_ok=True)
 
-    if not src_path.exists():
-        print(f"Warning: {label} prediction file not found: {src_path}")
+def split_prediction_file(
+    source: Path,
+    output_dir: Path,
+    required_columns: list[str],
+    optional_columns: list[str],
+    label: str,
+) -> int:
+    if output_dir.exists():
+        shutil.rmtree(output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    if not source.exists():
+        print(f"Warning: {label} prediction file not found: {source}")
         return 0
 
-    header = pd.read_csv(src_path, nrows=0)
-    missing = [c for c in required_cols if c not in header.columns]
+    header = pd.read_csv(source, nrows=0).columns.tolist()
+    missing = [c for c in required_columns if c not in header]
     if missing:
-        raise ValueError(f"{label} file missing required columns: {missing}")
-
-    usecols = list(required_cols) + [c for c in optional_cols if c in header.columns]
+        raise ValueError(f"{label} prediction file missing columns: {missing}")
+    usecols = required_columns + [c for c in optional_columns if c in header]
 
     seen: set[str] = set()
     total = 0
-    print(f"Splitting {label} predictions by file_id from {src_path} ...")
-    for chunk in pd.read_csv(src_path, usecols=usecols,
-                             chunksize=SPLIT_CHUNK_ROWS, low_memory=False):
+    for chunk in pd.read_csv(
+        source,
+        usecols=usecols,
+        chunksize=SPLIT_CHUNK_ROWS,
+        low_memory=False,
+    ):
         total += len(chunk)
-        for fid, g in chunk.groupby("file_id", sort=False):
-            sp = out_dir / (safe_fid(str(fid)) + ".csv")
-            write_header = sp.name not in seen
-            g.to_csv(sp, mode="a", header=write_header, index=False)
-            seen.add(sp.name)
-        print(f"  {label}: {total:,} rows processed, {len(seen):,} per-file CSVs so far")
-
-    print(f"{label}: split into {len(seen):,} per-file CSVs under {out_dir}")
+        for file_id, group in chunk.groupby("file_id", sort=False):
+            destination = output_dir / f"{safe_file_id(file_id)}.csv"
+            write_header = destination.name not in seen
+            group.to_csv(destination, mode="a", header=write_header, index=False)
+            seen.add(destination.name)
+        print(f"  {label}: {total:,} rows; {len(seen):,} retrieval files")
     return len(seen)
 
 
-def split_predictions_by_file() -> tuple[int, int]:
-    n_ml = _split_one(
-        ML_PRED_PATH, ML_SPLIT_DIR,
-        required_cols=["file_id", settings.KEY, "model", "prediction"],
-        optional_cols=[],
+def prepare_prediction_index() -> tuple[int, int]:
+    ml_count = split_prediction_file(
+        ML_PREDICTION_PATH,
+        ML_SPLIT_DIR,
+        required_columns=["file_id", cfg.KEY, "model", "prediction"],
+        optional_columns=[],
         label="ML",
     )
-    n_interp = _split_one(
-        INTERP_PRED_PATH, INTERP_SPLIT_DIR,
-        required_cols=["file_id", settings.KEY, "method", "prediction"],
-        optional_cols=["kriging_variance", "nearest_distance"],
-        label="Interpolation",
+    gi_count = split_prediction_file(
+        GI_PREDICTION_PATH,
+        GI_SPLIT_DIR,
+        required_columns=["file_id", cfg.KEY, "method", "prediction"],
+        optional_columns=[
+            "kriging_variance",
+            "nearest_distance_m",
+            "prediction_status",
+        ],
+        label="GI",
     )
-    return n_ml, n_interp
+    return ml_count, gi_count
 
 
-# ============================================================
-# PER-FILE PREDICTION READERS (small, in the main loop)
-# ============================================================
-
-def read_ml_for_file(fid: str) -> pd.DataFrame:
-    cols = ["file_id", settings.KEY] + [pred_col_name(m) for m in settings.ML_MODELS_TO_USE]
-    sp = ML_SPLIT_DIR / (safe_fid(fid) + ".csv")
-    if not sp.exists():
-        return pd.DataFrame(columns=cols)
-
-    df = pd.read_csv(sp)
-    if df.empty:
-        return pd.DataFrame(columns=cols)
-
-    df["prediction"] = pd.to_numeric(df["prediction"], errors="coerce")
-    wide = df.pivot_table(index=["file_id", settings.KEY], columns="model",
-                          values="prediction", aggfunc="first", dropna=False).reset_index()
+def read_ml_predictions(file_id: str) -> pd.DataFrame:
+    path = ML_SPLIT_DIR / f"{safe_file_id(file_id)}.csv"
+    columns = ["file_id", cfg.KEY] + [
+        prediction_column(model) for model in cfg.SELECTED_ML_MODELS
+    ]
+    if not path.exists():
+        return pd.DataFrame(columns=columns)
+    frame = pd.read_csv(path, low_memory=False)
+    frame["prediction"] = pd.to_numeric(frame["prediction"], errors="coerce")
+    wide = frame.pivot_table(
+        index=["file_id", cfg.KEY],
+        columns="model",
+        values="prediction",
+        aggfunc="first",
+        dropna=False,
+    ).reset_index()
     wide.columns.name = None
-    for m in settings.ML_MODELS_TO_USE:
-        if m not in wide.columns:
-            wide[m] = np.nan
-    wide = wide.rename(columns={c: pred_col_name(c)
-                                for c in wide.columns if c not in {"file_id", settings.KEY}})
-    for c in cols:
-        if c not in wide.columns:
-            wide[c] = np.nan
-    return wide[cols]
+    wide = wide.rename(
+        columns={model: prediction_column(model) for model in cfg.SELECTED_ML_MODELS}
+    )
+    for column in columns:
+        if column not in wide.columns:
+            wide[column] = np.nan
+    return wide[columns]
 
 
-def read_interp_for_file(fid: str) -> pd.DataFrame:
-    base_cols = ["file_id", settings.KEY] + \
-                [pred_col_name(m) for m in settings.INTERPOLATION_METHODS_TO_USE]
-    sp = INTERP_SPLIT_DIR / (safe_fid(fid) + ".csv")
-    if not sp.exists():
-        return pd.DataFrame(columns=base_cols)
-
-    df = pd.read_csv(sp)
-    if df.empty:
-        return pd.DataFrame(columns=base_cols)
-
-    df["prediction"] = pd.to_numeric(df["prediction"], errors="coerce")
-    wide = df.pivot_table(index=["file_id", settings.KEY], columns="method",
-                          values="prediction", aggfunc="first", dropna=False).reset_index()
+def read_gi_predictions(file_id: str) -> pd.DataFrame:
+    path = GI_SPLIT_DIR / f"{safe_file_id(file_id)}.csv"
+    base_columns = ["file_id", cfg.KEY] + [
+        prediction_column(method) for method in cfg.SELECTED_INTERPOLATION_METHODS
+    ]
+    if not path.exists():
+        return pd.DataFrame(columns=base_columns)
+    frame = pd.read_csv(path, low_memory=False)
+    frame["prediction"] = pd.to_numeric(frame["prediction"], errors="coerce")
+    wide = frame.pivot_table(
+        index=["file_id", cfg.KEY],
+        columns="method",
+        values="prediction",
+        aggfunc="first",
+        dropna=False,
+    ).reset_index()
     wide.columns.name = None
-    for m in settings.INTERPOLATION_METHODS_TO_USE:
-        if m not in wide.columns:
-            wide[m] = np.nan
-    out = wide.rename(columns={c: pred_col_name(c)
-                               for c in wide.columns if c not in {"file_id", settings.KEY}})
+    wide = wide.rename(
+        columns={
+            method: prediction_column(method)
+            for method in cfg.SELECTED_INTERPOLATION_METHODS
+        }
+    )
 
-    for method, diag_col, rename_col in [
-        ("centroid_ordinary_kriging", "kriging_variance", "kriging_variance_centroid_ok"),
-        ("nearest_neighbor_same_day", "nearest_distance", "nearest_distance_nn"),
-    ]:
-        if diag_col in df.columns:
-            sub = (df[df["method"].eq(method)][["file_id", settings.KEY, diag_col]]
-                   .rename(columns={diag_col: rename_col}))
-            out = out.merge(sub, on=["file_id", settings.KEY], how="left")
+    diagnostics = [
+        (
+            "centroid_ordinary_kriging",
+            "kriging_variance",
+            "kriging_variance_centroid_ok",
+        ),
+        ("regression_kriging", "kriging_variance", "kriging_variance_rk"),
+        (
+            "nearest_neighbor_same_day",
+            "nearest_distance_m",
+            "nearest_distance_m_nn",
+        ),
+    ]
+    for method, source_column, output_column in diagnostics:
+        if source_column in frame.columns:
+            sub = (
+                frame[frame["method"].eq(method)][
+                    ["file_id", cfg.KEY, source_column]
+                ]
+                .drop_duplicates(["file_id", cfg.KEY])
+                .rename(columns={source_column: output_column})
+            )
+            wide = wide.merge(
+                sub,
+                on=["file_id", cfg.KEY],
+                how="left",
+                validate="one_to_one",
+            )
 
-    for c in base_cols:
-        if c not in out.columns:
-            out[c] = np.nan
-    return out
+    for column in base_columns:
+        if column not in wide.columns:
+            wide[column] = np.nan
+    return wide
 
 
-def predictions_for_file(fid: str) -> pd.DataFrame:
-    ml     = read_ml_for_file(fid)
-    interp = read_interp_for_file(fid)
-    psub   = pd.merge(interp, ml, on=["file_id", settings.KEY], how="outer")
-    return psub
+def predictions_for_file(file_id: str) -> pd.DataFrame:
+    ml = read_ml_predictions(file_id)
+    gi = read_gi_predictions(file_id)
+    return gi.merge(ml, on=["file_id", cfg.KEY], how="outer", validate="one_to_one")
 
 
-# ============================================================
-# STACKING / WATERFALL
-# ============================================================
-
-def apply_waterfall(row: pd.Series, candidate_methods: list[str]) -> tuple[float, str]:
-    for method in candidate_methods:
-        col = pred_col_name(method)
-        if col in row.index:
-            val = row[col]
-            if pd.notna(val) and np.isfinite(float(val)):
-                return float(val), method
+def waterfall_value(row: pd.Series, methods: list[str]) -> tuple[float, str]:
+    for method in methods:
+        column = prediction_column(method)
+        if column in row.index:
+            value = pd.to_numeric(pd.Series([row[column]]), errors="coerce").iloc[0]
+            if pd.notna(value) and np.isfinite(float(value)):
+                return float(value), method
     return np.nan, "none"
 
 
-def apply_stacking_to_missing(missing_df, meta_model, waterfall_methods):
-    n = len(missing_df)
-    fill_values   = np.full(n, np.nan)
-    fill_methods  = ["none"] * n
-    fill_statuses = ["unfilled"] * n
+def fill_missing_rows(
+    missing: pd.DataFrame,
+    model_bundle: dict | None,
+    fallback_methods: list[str],
+) -> tuple[np.ndarray, list[str], list[str], np.ndarray]:
+    n = len(missing)
+    values = np.full(n, np.nan)
+    statuses = ["unfilled"] * n
+    methods = ["none"] * n
+    stacking_eligible = np.zeros(n, dtype=bool)
 
-    if meta_model is not None:
-        X_meta = missing_df.reindex(columns=META_FEATURE_COLS).copy()
-        for c in META_FEATURE_COLS:
-            if c not in X_meta.columns:
-                X_meta[c] = np.nan
-        X_meta = X_meta[META_FEATURE_COLS].to_numpy(dtype=float)
-
-        # Training (10g) and inference (here) must share the same ordered
-        # feature contract, or the model silently mis-maps columns.
-        n_expected = getattr(meta_model, "n_features_in_", len(META_FEATURE_COLS))
-        if X_meta.shape[1] != n_expected:
-            raise ValueError(
-                f"Meta-model expects {n_expected} features but got {X_meta.shape[1]}. "
-                "Re-train 10g and run 11c with the same META_FEATURE_COLS / BASE_PRED_COLS."
+    if model_bundle is not None and n:
+        meta = missing.reindex(columns=cfg.META_FEATURE_COLUMNS).apply(
+            pd.to_numeric, errors="coerce"
+        )
+        stacking_eligible = np.isfinite(meta.to_numpy(dtype=float)).all(axis=1)
+        if stacking_eligible.any():
+            prediction = np.asarray(
+                model_bundle["pipeline"].predict(meta.loc[stacking_eligible]),
+                dtype=float,
             )
+            eligible_indices = np.where(stacking_eligible)[0]
+            finite = np.isfinite(prediction)
+            for local_position, global_position in enumerate(eligible_indices):
+                if finite[local_position]:
+                    values[global_position] = prediction[local_position]
+                    statuses[global_position] = "filled"
+                    methods[global_position] = "stacking"
 
-        with warnings.catch_warnings():
-            warnings.simplefilter("ignore")
-            meta_preds = np.asarray(meta_model.predict(X_meta), dtype=float)
+    for index in np.where(~np.isfinite(values))[0]:
+        value, method = waterfall_value(missing.iloc[index], fallback_methods)
+        if np.isfinite(value):
+            values[index] = value
+            statuses[index] = "filled"
+            methods[index] = method
 
-        valid = np.isfinite(meta_preds)
-        fill_values[valid]   = meta_preds[valid]
-        for idx in np.where(valid)[0]:
-            fill_methods[idx]  = "stacking"
-            fill_statuses[idx] = "filled"
-
-    needs_fallback  = ~np.isfinite(fill_values)
-    if needs_fallback.any():
-        fallback_rows = missing_df[needs_fallback].reset_index(drop=True)
-        global_idxs   = np.where(needs_fallback)[0]
-        for local_i, (_, row) in enumerate(fallback_rows.iterrows()):
-            val, method = apply_waterfall(row, waterfall_methods)
-            gi = global_idxs[local_i]
-            if np.isfinite(val):
-                fill_values[gi]   = val
-                fill_methods[gi]  = method
-                fill_statuses[gi] = "filled"
-
-    return fill_values, fill_statuses, fill_methods
+    return values, statuses, methods, stacking_eligible
 
 
 def output_filename(input_path: Path) -> str:
-    name = input_path.name.replace("_complete_", "_gapfilled_").replace("complete", "gapfilled")
-    return name
+    return input_path.name.replace("_complete_", "_gapfilled_").replace(
+        "complete", "gapfilled"
+    )
 
-
-# ============================================================
-# MAIN
-# ============================================================
 
 def main() -> None:
-    print("11c: Finalize SMAP gap-filled files (stacking + regression_kriging, memory-safe)")
-    print("=" * 80)
-    print(f"Stacking model: {'enabled' if META_MODEL is not None else 'disabled'}")
-    print(f"Waterfall order: {[settings.FINAL_PRIMARY_METHOD] + list(settings.FINAL_FALLBACK_METHODS)}")
-    print("=" * 80)
+    bundle = load_meta_bundle()
+    fallback_methods = list(
+        dict.fromkeys([cfg.FINAL_PRIMARY_METHOD, *cfg.FINAL_FALLBACK_METHODS])
+    )
 
-    waterfall_methods = list(dict.fromkeys(
-        [settings.FINAL_PRIMARY_METHOD] + list(settings.FINAL_FALLBACK_METHODS)
-    ))
-    print("\nWaterfall fallback order:")
-    for m in waterfall_methods:
-        print(f"  - {m}")
+    print("11c: Finalize SMAP gap-filled files")
+    print("=" * 78)
+    print(f"Project seed: {cfg.RANDOM_SEED}")
+    print(f"Stacking:     {'enabled' if bundle is not None else 'disabled'}")
+    print(f"Fallbacks:    {fallback_methods}")
+    print("=" * 78)
 
-    # --- Split the big prediction files ONCE into per-file pieces ---
-    print("\nPreparing per-file prediction index (streaming, low memory)...")
-    n_ml, n_interp = split_predictions_by_file()
-    print(f"\nPer-file ML prediction CSVs:            {n_ml:,}")
-    print(f"Per-file interpolation prediction CSVs: {n_interp:,}")
+    ml_count, gi_count = prepare_prediction_index()
+    print(f"Indexed ML retrievals: {ml_count:,}")
+    print(f"Indexed GI retrievals: {gi_count:,}")
 
-    files = list_complete_files()
-    summary_rows = []
-
-    for i, (pass_name, path) in enumerate(files, start=1):
+    summaries: list[dict] = []
+    files = list_complete_files(years=cfg.GAPFILL_YEARS)
+    for index, (pass_name, path) in enumerate(files, start=1):
         date = parse_date_from_filename(path)
-        if date.year not in settings.GAPFILL_YEARS:
-            continue
+        frame = pd.read_csv(path, low_memory=False)
+        frame = add_basic_columns(frame, pass_name, path)
+        file_id = file_id_from_path(pass_name, path)
+        predictions = predictions_for_file(file_id)
+        merged = frame.merge(
+            predictions,
+            on=["file_id", cfg.KEY],
+            how="left",
+            validate="one_to_one",
+        )
 
-        df     = pd.read_csv(path, low_memory=False)
-        df     = add_basic_columns(df, pass_name, path)
-        fid    = file_id_from_path(pass_name, path)
+        target = pd.to_numeric(merged[cfg.TARGET], errors="coerce")
+        observed_mask = target.notna().to_numpy()
+        missing_mask = ~observed_mask
+        filled = target.to_numpy(dtype=float)
+        fill_status = np.where(observed_mask, "observed", "unfilled").astype(object)
+        fill_method = np.where(observed_mask, "observed", "none").astype(object)
+        stack_eligible_global = np.zeros(len(merged), dtype=bool)
 
-        # Only this day's predictions are read into memory.
-        psub   = predictions_for_file(fid)
-        merged = df.merge(psub, on=["file_id", settings.KEY], how="left")
-
-        is_missing     = merged[settings.TARGET].isna()
-        observed_mask  = ~is_missing
-
-        fill_values    = np.where(observed_mask, pd.to_numeric(merged[settings.TARGET], errors="coerce"), np.nan)
-        fill_statuses  = np.where(observed_mask, "observed", "unfilled").tolist()
-        fill_methods   = np.where(observed_mask, "observed", "none").tolist()
-
-        missing_rows = merged[is_missing].copy()
-        if len(missing_rows) > 0:
-            fv, fs, fm = apply_stacking_to_missing(missing_rows, META_MODEL, waterfall_methods)
-            for local_i, global_i in enumerate(np.where(is_missing)[0]):
-                fill_values[global_i]   = fv[local_i]
-                fill_statuses[global_i] = fs[local_i]
-                fill_methods[global_i]  = fm[local_i]
-
-        merged["soil_moisture_filled"] = fill_values
-        merged["fill_status"]          = fill_statuses
-        merged["fill_method"]          = fill_methods
-
-        if settings.CLIP_FILLED_VALUES:
-            clip_mask = merged["fill_status"].eq("filled")
-            merged.loc[clip_mask, "soil_moisture_filled"] = (
-                merged.loc[clip_mask, "soil_moisture_filled"].clip(settings.CLIP_MIN, settings.CLIP_MAX)
+        if missing_mask.any():
+            missing_rows = merged.loc[missing_mask].copy()
+            values, statuses, methods, eligible = fill_missing_rows(
+                missing_rows,
+                bundle,
+                fallback_methods,
             )
+            global_indices = np.where(missing_mask)[0]
+            filled = np.array(filled, dtype=float, copy=True)
+            filled[global_indices] = values
+            fill_status[global_indices] = statuses
+            fill_method[global_indices] = methods
+            stack_eligible_global[global_indices] = eligible
 
-        n_rows    = len(merged)
-        n_obs     = int(observed_mask.sum())
-        n_miss    = int(is_missing.sum())
-        n_filled  = int((merged["fill_status"] == "filled").sum())
-        n_unfill  = int((merged["fill_status"] == "unfilled").sum())
-        mc        = merged["fill_method"].value_counts(dropna=False).to_dict()
+        merged["soil_moisture_filled"] = filled
+        merged["fill_status"] = fill_status
+        merged["fill_method"] = fill_method
+        merged["stacking_eligible"] = stack_eligible_global
 
-        out_name = output_filename(path)
-        out_path = settings.FINAL_DIR / pass_name / out_name
-        merged.to_csv(out_path, index=False)
+        if cfg.CLIP_FILLED_VALUES:
+            mask = merged["fill_status"].eq("filled")
+            merged.loc[mask, "soil_moisture_filled"] = merged.loc[
+                mask, "soil_moisture_filled"
+            ].clip(cfg.CLIP_MIN, cfg.CLIP_MAX)
 
+        output_path = cfg.FINAL_DIR / pass_name / output_filename(path)
+        merged.to_csv(output_path, index=False)
+
+        counts = merged["fill_method"].value_counts(dropna=False).to_dict()
         summary = {
-            "file_id": fid, "date": date.date().isoformat(), "year": date.year,
-            "pass": pass_name, "source_file": str(path), "output_file": str(out_path),
-            "n_rows": n_rows, "n_observed_original": n_obs, "n_missing_original": n_miss,
-            "n_filled": n_filled, "n_unfilled": n_unfill,
-            "stacking_used": META_MODEL is not None,
-            "min_soil_moisture_filled": pd.to_numeric(merged["soil_moisture_filled"], errors="coerce").min(),
-            "max_soil_moisture_filled": pd.to_numeric(merged["soil_moisture_filled"], errors="coerce").max(),
+            "file_id": file_id,
+            "date": date.date().isoformat(),
+            "year": int(date.year),
+            "pass": pass_name,
+            "source_file": str(path.resolve()),
+            "output_file": str(output_path.resolve()),
+            "n_rows": len(merged),
+            "n_observed_original": int(observed_mask.sum()),
+            "n_missing_original": int(missing_mask.sum()),
+            "n_stacking_eligible": int(stack_eligible_global.sum()),
+            "n_filled": int(merged["fill_status"].eq("filled").sum()),
+            "n_unfilled": int(merged["fill_status"].eq("unfilled").sum()),
+            "stacking_enabled": bundle is not None,
+            "min_soil_moisture_filled": pd.to_numeric(
+                merged["soil_moisture_filled"], errors="coerce"
+            ).min(),
+            "max_soil_moisture_filled": pd.to_numeric(
+                merged["soil_moisture_filled"], errors="coerce"
+            ).max(),
         }
-        for method, count in mc.items():
+        for method, count in counts.items():
             summary[f"fill_method_count__{method}"] = int(count)
-        summary_rows.append(summary)
+        summaries.append(summary)
 
-        if i % 100 == 0 or i == 1:
-            stacking_count = mc.get("stacking", 0)
+        if index == 1 or index % 100 == 0:
             print(
-                f"  [{i}] {date.date()} {pass_name.upper()} | "
-                f"obs={n_obs} miss={n_miss} filled={n_filled} "
-                f"(stacking={stacking_count}) unfilled={n_unfill}"
+                f"  [{index}] {date.date()} {pass_name.upper()} | "
+                f"missing={summary['n_missing_original']} "
+                f"stack-eligible={summary['n_stacking_eligible']} "
+                f"stacked={counts.get('stacking', 0)} "
+                f"unfilled={summary['n_unfilled']}"
             )
 
-    summary_by_file = pd.DataFrame(summary_rows)
+    summary_by_file = pd.DataFrame(summaries)
     summary_by_file.to_csv(SUMMARY_BY_FILE_PATH, index=False)
-
+    method_columns = [
+        column for column in summary_by_file if column.startswith("fill_method_count__")
+    ]
     overall = {
         "n_files": len(summary_by_file),
         "n_rows": int(summary_by_file["n_rows"].sum()),
         "n_observed_original": int(summary_by_file["n_observed_original"].sum()),
         "n_missing_original": int(summary_by_file["n_missing_original"].sum()),
+        "n_stacking_eligible": int(summary_by_file["n_stacking_eligible"].sum()),
         "n_filled": int(summary_by_file["n_filled"].sum()),
         "n_unfilled": int(summary_by_file["n_unfilled"].sum()),
-        "stacking_enabled": META_MODEL is not None,
-        "primary_method": settings.FINAL_PRIMARY_METHOD,
-        "fallback_methods": ";".join(settings.FINAL_FALLBACK_METHODS),
-        "clip_filled_values": settings.CLIP_FILLED_VALUES,
+        "stacking_enabled": bundle is not None,
+        "project_seed": cfg.RANDOM_SEED,
+        "fallback_methods": ";".join(fallback_methods),
+        "clip_filled_values": cfg.CLIP_FILLED_VALUES,
     }
+    for column in method_columns:
+        overall[column] = int(summary_by_file[column].fillna(0).sum())
     pd.DataFrame([overall]).to_csv(OVERALL_SUMMARY_PATH, index=False)
 
-    # Clean up the temporary per-file split to reclaim disk.
-    try:
+    if SPLIT_ROOT.exists():
         shutil.rmtree(SPLIT_ROOT)
-        print(f"\nCleaned temp split dir: {SPLIT_ROOT}")
-    except Exception as exc:
-        print(f"\nNote: could not remove temp split dir {SPLIT_ROOT} ({exc}).")
 
-    print("\nSaved:", SUMMARY_BY_FILE_PATH)
-    print("Saved:", OVERALL_SUMMARY_PATH)
-    print("\nOverall:")
-    for k, v in overall.items():
-        print(f"  {k}: {v}")
-
-    if "fill_method_count__stacking" in summary_by_file.columns:
-        print(f"\n  Total pixels by stacking: {int(summary_by_file['fill_method_count__stacking'].sum()):,}")
-
-    print("\nDone.")
+    print("\nSaved:")
+    print(f"  {SUMMARY_BY_FILE_PATH}")
+    print(f"  {OVERALL_SUMMARY_PATH}")
+    print("\nOverall summary:")
+    for key, value in overall.items():
+        print(f"  {key}: {value}")
 
 
 if __name__ == "__main__":

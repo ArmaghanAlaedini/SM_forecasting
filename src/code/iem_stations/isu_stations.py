@@ -3,7 +3,14 @@ from pathlib import Path
 import sys
 import pandas as pd
 import geopandas as gpd
+# import pyogrio  # doens't work (figure out why) used fiona instead
 import matplotlib.pyplot as plt
+from adjustText import adjust_text
+
+
+# print(gpd.__version__)
+# print(pyogrio.__version__)
+
 
 def _find_project_root(start: Path) -> Path:
     """
@@ -43,10 +50,8 @@ ensure_dirs()
 
 stations = pd.read_csv(RAW_ISU / "stations.csv")
 stations_meta = pd.read_csv(RAW_ISU / "stations_meta.csv")
-
 print("stations path:", RAW_ISU / "stations.csv")
 print("metadata path:", RAW_ISU / "stations_meta.csv")
-
 print(stations.head())
 print(stations.columns.tolist())
 print(stations_meta.head())
@@ -92,10 +97,6 @@ station_list.shape
 print(station_list)
 
 print("Saved to:", PROC_ISU_STATIONS_FULL)
-
-
-
-import matplotlib.pyplot as plt
 
 plt.figure(figsize=(10, 8))
 plt.scatter(station_list["lon"], station_list["lat"])

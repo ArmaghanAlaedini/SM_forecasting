@@ -1,0 +1,26 @@
+Clean sbatch folder contents
+==================================================
+01_smap_lattice.sbatch
+03_iem_kriging.sbatch
+05_full_smap_iem.sbatch
+07_validate_full_data.sbatch
+09_prepare_modeling.sbatch
+10a_ml_validation.sbatch
+10b_gi_validation.sbatch
+10c_build_stack.sbatch
+10d_ml_test.sbatch
+10e_gi_test.sbatch
+10h_evaluate_stack.sbatch
+11a_ml_gapfill.sbatch
+11b_gi_gapfill.sbatch
+11c_finalize.sbatch
+12_visualize.sbatch
+README.md
+archive_old_outputs.sh
+common.sh
+copy_results_back.sh
+preflight.sh
+status.sh
+submit_full_pipeline.sh
+submit_modeling_pipeline.sh
+sync_to_nova.sh

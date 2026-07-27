@@ -1,347 +1,243 @@
 #!/usr/bin/env python3
-"""
-10c_compare_validation_results.py
+"""Compare 2024 ML and GI predictions on common target support.
 
-Purpose
--------
-Compare validation results from:
+Unlike the old script, this version reads prediction-level files rather than
+concatenating metrics computed with different aggregation rules.  It reports:
 
-  10a_ML_validation.py
-  10b_interpolation_validation.R
+* method-specific pooled metrics using each method's finite predictions;
+* common-support pooled metrics using only target keys predicted by every
+  candidate method; and
+* prediction coverage.
 
-This script does NOT train models, test models, or fill SMAP gaps.
-It only reads validation metrics, ranks methods, and writes clean summary tables.
-
-Inputs
-------
-src/data/processed/smap_gap_filling/05_gapfill_model_validation/ml/ml_validation_metrics.csv
-src/data/processed/smap_gap_filling/05_gapfill_model_validation/interpolation/interpolation_validation_metrics.csv
-
-Outputs
--------
-src/data/processed/smap_gap_filling/05_gapfill_model_validation/comparison/
-    combined_validation_metrics.csv
-    best_methods_by_holdout.csv
-    recommended_base_models.csv
-    summary_report.txt
-    figures/
-        combined_rmse_random_cell.pdf
-        combined_rmse_spatial_block.pdf
+Recommendations are based on spatial-block RMSE on common support.
 """
 
 from __future__ import annotations
 
-import importlib.util
-from pathlib import Path
-
-import pandas as pd
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
+import numpy as np
+import pandas as pd
+
+from gapfill_workflow_common import cfg, compute_metrics
 
 
-# ============================================================
-# LOAD CONFIG  ← FIXED: no more hardcoded /home/armaghan path
-# ============================================================
-
-def load_config():
-    config_path = Path(__file__).resolve().with_name("00_config.py")
-    spec = importlib.util.spec_from_file_location("cfg", config_path)
-    cfg = importlib.util.module_from_spec(spec)
-    if spec.loader is None:
-        raise ImportError(f"Could not load config from {config_path}")
-    spec.loader.exec_module(cfg)
-    return cfg
-
-
-cfg = load_config()
-
-
-# ============================================================
-# PATHS  ← all derived from config, not hardcoded
-# ============================================================
-
-VALIDATION_DIR = cfg.GAP_FILLING_DIR / "05_gapfill_model_validation"
-
-ML_METRICS_PATH = VALIDATION_DIR / "ml" / "ml_validation_metrics.csv"
-INTERP_METRICS_PATH = VALIDATION_DIR / "interpolation" / "interpolation_validation_metrics.csv"
-
-OUT_DIR = VALIDATION_DIR / "comparison"
+ML_PATH = cfg.ML_VALIDATION_DIR / "ml_validation_predictions.csv"
+GI_PATH = cfg.INTERP_VALIDATION_DIR / "interpolation_validation_predictions.csv"
+OUT_DIR = cfg.COMPARISON_DIR
 FIG_DIR = OUT_DIR / "figures"
+
+COMBINED_PATH = OUT_DIR / "combined_validation_metrics.csv"
+COVERAGE_PATH = OUT_DIR / "validation_prediction_coverage.csv"
+RECOMMENDATION_PATH = OUT_DIR / "recommended_base_models.csv"
+SUMMARY_PATH = OUT_DIR / "summary_report.txt"
 
 OUT_DIR.mkdir(parents=True, exist_ok=True)
 FIG_DIR.mkdir(parents=True, exist_ok=True)
 
-
-# ============================================================
-# CONFIG
-# ============================================================
-
-# Use spatial_block as the main decision criterion because it is harder
-# and closer to realistic clustered missingness.
-PRIMARY_HOLDOUT = "spatial_block"
-
-# FFNN was unstable/weak in validation, so exclude from recommendations.
-EXCLUDE_MODELS_FROM_RECOMMENDATION = {"ffnn_mlp", "baseline", "baseline_train_mean"}
-
-# How many ML models to keep for script 11 candidate predictions.
-N_ML_MODELS_TO_RECOMMEND = 3
-
-# Keep the two interpolation methods: centroid OK + nearest neighbour.
-N_INTERP_METHODS_TO_RECOMMEND = 2
+KEY_COLUMNS = ["split", "holdout_mode", "date", "pass", cfg.KEY]
 
 
-# ============================================================
-# HELPERS
-# ============================================================
-
-def require_file(path: Path) -> None:
+def require(path):
     if not path.exists():
-        raise FileNotFoundError(f"Required file does not exist: {path}")
+        raise FileNotFoundError(f"Required file not found: {path}")
 
 
-def read_ml_metrics(path: Path) -> pd.DataFrame:
-    require_file(path)
-    df = pd.read_csv(path)
+def load_predictions() -> pd.DataFrame:
+    require(ML_PATH)
+    require(GI_PATH)
 
-    required = {
-        "split", "holdout_mode", "feature_group", "model",
-        "n_features", "features", "rmse", "mae", "bias", "r2", "n",
-    }
-    missing = sorted(required - set(df.columns))
-    if missing:
-        raise ValueError(f"ML metrics missing required columns: {missing}")
+    ml = pd.read_csv(ML_PATH, low_memory=False)
+    ml = ml[
+        ml["feature_group"].eq(cfg.FINAL_ML_FEATURE_GROUP)
+        & ml["model"].isin(cfg.CANDIDATE_ML_MODELS)
+    ].copy()
+    ml["method"] = ml["model"]
+    ml["method_family"] = "ML"
 
-    out = df.copy()
-    out["method_family"] = "ML"
-    out["method"] = out["model"].astype(str)
-    out["method_name"] = out["model"].astype(str) + " | " + out["feature_group"].astype(str)
-    out["source_file"] = str(path)
-    return out
+    gi = pd.read_csv(GI_PATH, low_memory=False)
+    gi = gi[gi["method"].isin(cfg.SELECTED_INTERPOLATION_METHODS)].copy()
+    gi["method_family"] = "GI"
 
-
-def read_interpolation_metrics(path: Path) -> pd.DataFrame:
-    require_file(path)
-    df = pd.read_csv(path)
-
-    required = {"split", "holdout_mode", "method", "rmse", "mae", "bias", "r2", "n"}
-    missing = sorted(required - set(df.columns))
-    if missing:
-        raise ValueError(f"Interpolation metrics missing required columns: {missing}")
-
-    out = df.copy()
-    out["method_family"] = "Interpolation"
-    out["model"] = out["method"].astype(str)
-    out["feature_group"] = ""
-    out["n_features"] = out.get("n_features", pd.Series([pd.NA] * len(out)))
-    out["features"] = out.get("features", pd.Series([""] * len(out)))
-    out["method_name"] = out["method"].astype(str)
-    out["source_file"] = str(path)
-    return out
-
-
-def standardize_columns(df: pd.DataFrame) -> pd.DataFrame:
-    cols = [
-        "split", "holdout_mode", "method_family", "method", "method_name",
-        "feature_group", "model", "n_features", "features",
-        "rmse", "mae", "bias", "r2", "n", "source_file",
+    common_columns = KEY_COLUMNS + [
+        "observed",
+        "prediction",
+        "method",
+        "method_family",
     ]
-    for c in cols:
-        if c not in df.columns:
-            df[c] = pd.NA
+    for frame in [ml, gi]:
+        frame["date"] = pd.to_datetime(frame["date"], errors="raise").dt.normalize()
+        frame[cfg.KEY] = frame[cfg.KEY].astype(str)
+        frame["observed"] = pd.to_numeric(frame["observed"], errors="coerce")
+        frame["prediction"] = pd.to_numeric(frame["prediction"], errors="coerce")
 
-    out = df[cols].copy()
-    for c in ["n_features", "rmse", "mae", "bias", "r2", "n"]:
-        out[c] = pd.to_numeric(out[c], errors="coerce")
-
-    return out.sort_values(["holdout_mode", "rmse", "mae"]).reset_index(drop=True)
-
-
-def add_ranks(df: pd.DataFrame) -> pd.DataFrame:
-    out = df.copy()
-    out["rank_within_holdout"] = (
-        out.groupby("holdout_mode")["rmse"]
-        .rank(method="min", ascending=True)
-        .astype("Int64")
-    )
-    out["rank_within_family_holdout"] = (
-        out.groupby(["holdout_mode", "method_family"])["rmse"]
-        .rank(method="min", ascending=True)
-        .astype("Int64")
-    )
-    return out
+    combined = pd.concat([ml[common_columns], gi[common_columns]], ignore_index=True)
+    duplicated = combined.duplicated(KEY_COLUMNS + ["method"], keep=False)
+    if duplicated.any():
+        examples = combined.loc[duplicated, KEY_COLUMNS + ["method"]].head().to_dict("records")
+        raise ValueError(f"Duplicate method/target predictions found: {examples}")
+    return combined
 
 
-def make_best_by_holdout(df: pd.DataFrame) -> pd.DataFrame:
-    rows = []
-    for holdout, sub in df.groupby("holdout_mode"):
-        rows.append(sub.sort_values(["rmse", "mae"]).head(1))
-    return pd.concat(rows, ignore_index=True)
+def metric_rows(predictions: pd.DataFrame, support_name: str) -> list[dict]:
+    rows: list[dict] = []
+    for (holdout_mode, family, method), sub in predictions.groupby(
+        ["holdout_mode", "method_family", "method"], sort=True
+    ):
+        row = {
+            "split": "validation",
+            "holdout_mode": holdout_mode,
+            "support": support_name,
+            "method_family": family,
+            "method": method,
+            "n_targets": len(sub),
+        }
+        row.update(compute_metrics(sub["observed"], sub["prediction"]))
+        row["coverage"] = row["n"] / len(sub) if len(sub) else np.nan
+        rows.append(row)
+    return rows
 
 
-def make_recommendations(df: pd.DataFrame) -> pd.DataFrame:
-    primary = df[df["holdout_mode"].eq(PRIMARY_HOLDOUT)].copy()
-    if primary.empty:
-        raise ValueError(f"No rows found for PRIMARY_HOLDOUT={PRIMARY_HOLDOUT}")
+def common_support_predictions(predictions: pd.DataFrame) -> pd.DataFrame:
+    expected_methods = sorted(predictions["method"].unique())
+    finite = predictions[np.isfinite(predictions["prediction"])].copy()
+    counts = finite.groupby(KEY_COLUMNS)["method"].nunique()
+    complete_keys = counts[counts.eq(len(expected_methods))].reset_index()[KEY_COLUMNS]
+    common = predictions.merge(complete_keys, on=KEY_COLUMNS, how="inner", validate="many_to_one")
+    if common.empty:
+        raise RuntimeError(
+            "No validation target has predictions from every candidate method. "
+            "Inspect 10a/10b prediction coverage."
+        )
+    return common
 
-    recommendations = []
 
-    # Interpolation
-    interp = primary[primary["method_family"].eq("Interpolation")].sort_values(["rmse", "mae"])
-    if not interp.empty:
-        keep = interp.head(N_INTERP_METHODS_TO_RECOMMEND).copy()
-        keep["recommendation_role"] = [
-            "primary_spatial_gap_filler" if i == 0 else "interpolation_baseline"
-            for i in range(len(keep))
+def make_recommendations(metrics: pd.DataFrame) -> pd.DataFrame:
+    primary = metrics[
+        metrics["support"].eq("common_support")
+        & metrics["holdout_mode"].eq(cfg.STACKING_HOLDOUT_MODE)
+    ].copy()
+
+    ml = (
+        primary[
+            primary["method_family"].eq("ML")
+            & ~primary["method"].eq("ffnn_mlp")
         ]
-        recommendations.append(keep)
+        .sort_values(["rmse", "mae"])
+        .head(len(cfg.SELECTED_ML_MODELS))
+        .copy()
+    )
+    ml["recommendation_role"] = "selected_ml_base_learner"
 
-    # ML: best feature group per model first
-    ml = primary[primary["method_family"].eq("ML")].copy()
-    ml = ml[~ml["model"].isin(EXCLUDE_MODELS_FROM_RECOMMENDATION)]
-    ml = ml.sort_values(["model", "rmse", "mae"])
-    ml_best = ml.groupby("model", as_index=False).head(1).sort_values(["rmse", "mae"])
-    if not ml_best.empty:
-        keep = ml_best.head(N_ML_MODELS_TO_RECOMMEND).copy()
-        keep["recommendation_role"] = "ml_auxiliary_baseline"
-        recommendations.append(keep)
+    gi = primary[
+        primary["method_family"].eq("GI")
+        & primary["method"].isin(cfg.SELECTED_INTERPOLATION_METHODS)
+    ].sort_values(["rmse", "mae"]).copy()
+    gi["recommendation_role"] = "selected_gi_base_learner"
 
-    if not recommendations:
-        return pd.DataFrame()
-
-    out = pd.concat(recommendations, ignore_index=True)
-    out = out.sort_values(["recommendation_role", "rmse", "mae"]).reset_index(drop=True)
-    out["use_in_script_11"] = True
-    return out
+    recs = pd.concat([ml, gi], ignore_index=True)
+    recs["configured_for_stacking"] = recs["method"].isin(
+        cfg.SELECTED_ML_MODELS + cfg.SELECTED_INTERPOLATION_METHODS
+    )
+    return recs
 
 
-def write_report(
-    combined: pd.DataFrame,
-    best: pd.DataFrame,
-    recs: pd.DataFrame,
-    path: Path,
-) -> None:
-    lines = [
-        "SMAP Gap-Filling Validation Comparison",
-        "=" * 45,
-        "",
-        f"Primary decision holdout: {PRIMARY_HOLDOUT}",
-        "",
-        "Interpretation rule:",
-        "  Lower RMSE/MAE is better. Spatial-block validation should be treated",
-        "  as more important than random-cell validation because it is harder",
-        "  and more realistic for clustered missingness.",
-        "",
-        "Best method by holdout mode:",
-        "-" * 45,
-    ]
+def plot_rmse(metrics: pd.DataFrame) -> None:
+    for support in ["common_support", "method_specific"]:
+        for mode in cfg.HOLDOUT_MODES:
+            sub = metrics[
+                metrics["support"].eq(support)
+                & metrics["holdout_mode"].eq(mode)
+            ].sort_values("rmse")
+            if sub.empty:
+                continue
+            fig, ax = plt.subplots(figsize=(9, max(4, 0.38 * len(sub))))
+            labels = sub["method"] + " | " + sub["method_family"]
+            ax.barh(labels, sub["rmse"])
+            ax.invert_yaxis()
+            ax.set_xlabel("Pooled RMSE")
+            ax.set_title(f"2024 validation: {mode}, {support.replace('_', ' ')}")
+            ax.grid(axis="x", alpha=0.25)
+            fig.tight_layout()
+            fig.savefig(FIG_DIR / f"combined_rmse_{mode}_{support}.pdf", bbox_inches="tight")
+            plt.close(fig)
 
-    if not best.empty:
-        lines.append(
-            best[["holdout_mode", "method_family", "method_name",
-                  "rmse", "mae", "bias", "r2", "n"]].to_string(index=False)
-        )
-
-    lines += ["", "Recommended base models for next stage:", "-" * 45]
-
-    if not recs.empty:
-        lines.append(
-            recs[["recommendation_role", "method_family", "method_name",
-                  "rmse", "mae", "bias", "r2", "n"]].to_string(index=False)
-        )
-    else:
-        lines.append("No recommendations generated.")
-
-    lines += ["", "Top 15 methods under spatial-block validation:", "-" * 45]
-    spatial = combined[combined["holdout_mode"].eq("spatial_block")]
-    if not spatial.empty:
-        lines.append(
-            spatial.sort_values(["rmse", "mae"])
-            [["method_family", "method_name", "rmse", "mae", "bias", "r2", "n"]]
-            .head(15)
-            .to_string(index=False)
-        )
-
-    path.write_text("\n".join(lines))
-
-
-def plot_rmse(df: pd.DataFrame, holdout_mode: str, path: Path, top_n: int = 20) -> None:
-    sub = df[df["holdout_mode"].eq(holdout_mode)].copy()
-    sub = sub.sort_values(["rmse", "mae"]).head(top_n)
-    if sub.empty:
-        return
-
-    labels = sub["method_name"].astype(str).tolist()
-    rmse = sub["rmse"].tolist()
-
-    height = max(5, 0.35 * len(sub))
-    plt.figure(figsize=(10, height))
-    plt.barh(labels[::-1], rmse[::-1])
-    plt.xlabel("RMSE")
-    plt.title(f"Top {len(sub)} methods by RMSE: {holdout_mode}")
-    plt.tight_layout()
-    plt.savefig(path)
-    plt.close()
-
-
-# ============================================================
-# MAIN
-# ============================================================
 
 def main() -> None:
-    print("Comparing SMAP gap-filling validation results")
-    print("=" * 70)
-    print(f"Project root:          {cfg.PROJECT_ROOT}")
-    print(f"ML metrics:            {ML_METRICS_PATH}")
-    print(f"Interpolation metrics: {INTERP_METRICS_PATH}")
-    print(f"Output folder:         {OUT_DIR}")
-    print("=" * 70)
+    print("10c: Compare validation methods on aligned 2024 targets")
+    print("=" * 78)
+    predictions = load_predictions()
+    common = common_support_predictions(predictions)
 
-    ml = read_ml_metrics(ML_METRICS_PATH)
-    interp = read_interpolation_metrics(INTERP_METRICS_PATH)
+    rows = metric_rows(predictions, "method_specific")
+    rows.extend(metric_rows(common, "common_support"))
+    metrics = pd.DataFrame(rows).sort_values(
+        ["support", "holdout_mode", "rmse", "mae", "method"]
+    )
 
-    combined = pd.concat([ml, interp], ignore_index=True)
-    combined = standardize_columns(combined)
-    combined = add_ranks(combined)
+    coverage = (
+        predictions.assign(finite=np.isfinite(predictions["prediction"]))
+        .groupby(["holdout_mode", "method_family", "method"], as_index=False)
+        .agg(n_targets=(cfg.KEY, "size"), n_predictions=("finite", "sum"))
+    )
+    coverage["coverage"] = coverage["n_predictions"] / coverage["n_targets"]
 
-    best = make_best_by_holdout(combined)
-    recs = make_recommendations(combined)
-
-    combined_path = OUT_DIR / "combined_validation_metrics.csv"
-    best_path = OUT_DIR / "best_methods_by_holdout.csv"
-    recs_path = OUT_DIR / "recommended_base_models.csv"
-    report_path = OUT_DIR / "summary_report.txt"
-
-    combined.to_csv(combined_path, index=False)
-    best.to_csv(best_path, index=False)
-    recs.to_csv(recs_path, index=False)
-    write_report(combined, best, recs, report_path)
-
-    for holdout in sorted(combined["holdout_mode"].dropna().unique()):
-        plot_rmse(
-            combined,
-            holdout_mode=holdout,
-            path=FIG_DIR / f"combined_rmse_{holdout}.pdf",
-            top_n=20,
+    recommendations = make_recommendations(metrics)
+    recommended_ml = set(
+        recommendations.loc[
+            recommendations["recommendation_role"].eq("selected_ml_base_learner"),
+            "method",
+        ]
+    )
+    configured_ml = set(cfg.SELECTED_ML_MODELS)
+    if recommended_ml != configured_ml:
+        recommendations.to_csv(RECOMMENDATION_PATH, index=False)
+        raise RuntimeError(
+            "The top three 2024 ML models differ from SELECTED_ML_MODELS in "
+            "00_config.py. Review recommended_base_models.csv, update the "
+            "configuration deliberately, and rerun 10c onward. "
+            f"Recommended={sorted(recommended_ml)}, configured={sorted(configured_ml)}"
         )
+
+    metrics.to_csv(COMBINED_PATH, index=False)
+    coverage.to_csv(COVERAGE_PATH, index=False)
+    recommendations.to_csv(RECOMMENDATION_PATH, index=False)
+    plot_rmse(metrics)
+
+    report_lines = [
+        "SMAP gap-filling aligned validation comparison",
+        "=" * 52,
+        f"Project seed: {cfg.RANDOM_SEED}",
+        f"Final ML feature group: {cfg.FINAL_ML_FEATURE_GROUP}",
+        f"Candidate methods: {sorted(predictions['method'].unique())}",
+        f"Common-support prediction rows: {len(common):,}",
+        "",
+        "Spatial-block common-support metrics",
+        "-" * 52,
+        metrics[
+            metrics["support"].eq("common_support")
+            & metrics["holdout_mode"].eq("spatial_block")
+        ].to_string(index=False),
+        "",
+        "Recommendations",
+        "-" * 52,
+        recommendations.to_string(index=False),
+    ]
+    SUMMARY_PATH.write_text("\n".join(report_lines))
 
     print("\nSaved:")
-    print(f"  {combined_path}")
-    print(f"  {best_path}")
-    print(f"  {recs_path}")
-    print(f"  {report_path}")
-    print(f"  {FIG_DIR}")
-
-    print("\nRecommended base models:")
-    if not recs.empty:
-        print(
-            recs[["recommendation_role", "method_family", "method_name",
-                  "rmse", "mae", "bias", "r2", "n"]].to_string(index=False)
-        )
-    else:
-        print("No recommendations generated.")
-
-    print("\nDone.")
+    print(f"  {COMBINED_PATH}")
+    print(f"  {COVERAGE_PATH}")
+    print(f"  {RECOMMENDATION_PATH}")
+    print(f"  {SUMMARY_PATH}")
+    print("\nSpatial-block common-support metrics:")
+    print(
+        metrics[
+            metrics["support"].eq("common_support")
+            & metrics["holdout_mode"].eq("spatial_block")
+        ].to_string(index=False)
+    )
 
 
 if __name__ == "__main__":

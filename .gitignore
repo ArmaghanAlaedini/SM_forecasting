@@ -44,6 +44,10 @@ src/code/smap/smap_lat_long.py
 src/code/archived_forecast/api_test.py
 src/code/archived_forecast/hrrr_test
 src/code/smap_gap_filling/inspect_gapfilled.py
+src/code/smap_gap_filling/CHANGELOG_AND_TESTS.md
+src/code/smap_gap_filling/README_FIXED_WORKFLOW.md
+src/code/smap_gap_filling/Visualization/CHANGELOG_VISUALIZATION.md
+src/code/smap_gap_filling/Visualization/README_VISUALIZATION.md
 # ============================================================
 # Data: raw, processed, generated
 # ============================================================
@@ -69,7 +73,7 @@ src/data/**
 *.prj
 *.tif
 *.tiff
-
+*.sh
 # ============================================================
 # Logs and generated outputs
 # ============================================================
@@ -124,4 +128,4 @@ envs/
 dist/
 build/
 *.egg-info/
-.eggs/
+*.eggs/

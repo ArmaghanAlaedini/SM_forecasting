@@ -1,271 +1,107 @@
-from pathlib import Path
-import importlib.util
-import os
+#!/usr/bin/env python3
+"""Visualize the Iowa SMAP lattice and civil-township boundaries.
 
-# Help avoid common PROJ path issues.
-try:
-    from pyproj import datadir
-    os.environ["PROJ_DATA"] = datadir.get_data_dir()
-except Exception:
-    pass
+Inputs
+------
+* ``support/smap_lattice/smap_lattice_iowa.parquet``
+* the township shapefile configured by ``TOWNSHIP_SHP_PATH``
+
+Outputs
+-------
+``09_final_visualization/01_lattice/``
+"""
+
+from __future__ import annotations
 
 import geopandas as gpd
+import matplotlib
+matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
-
-# ============================================================
-# 0. Load config
-# ============================================================
-
-def load_config():
-    """Load 00_config.py even though the filename starts with a number."""
-    config_path = Path(__file__).resolve().parent.parent / "00_config.py"
-    
-    spec = importlib.util.spec_from_file_location("cfg", config_path)
-    cfg = importlib.util.module_from_spec(spec)
-
-    if spec.loader is None:
-        raise ImportError(f"Could not load config from {config_path}")
-
-    spec.loader.exec_module(cfg)
-    return cfg
+from visualization_common import VISUALIZATION_ROOT, cfg, read_townships, save_figure
 
 
-cfg = load_config()
-
-
-# ============================================================
-# 1. Paths
-# ============================================================
-
+OUT_DIR = VISUALIZATION_ROOT / "01_lattice"
+OUT_DIR.mkdir(parents=True, exist_ok=True)
 LATTICE_PATH = cfg.SMAP_LATTICE_DIR / "smap_lattice_iowa.parquet"
-TOWNSHIP_SHP_PATH = cfg.TOWNSHIP_SHP_PATH
-
-FIG_DIR = cfg.SMAP_LATTICE_DIR / "figures"
-FIG_DIR.mkdir(parents=True, exist_ok=True)
 
 
-# ============================================================
-# 2. Load data
-# ============================================================
-
-def read_townships(path: Path) -> gpd.GeoDataFrame:
-    """
-    Read township shapefile.
-
-    Fiona is used first because it avoids some pyogrio/PROJ mismatch issues.
-    """
-    try:
-        return gpd.read_file(path, engine="fiona")
-    except Exception:
-        return gpd.read_file(path)
-
-
-def load_data() -> tuple[gpd.GeoDataFrame, gpd.GeoDataFrame]:
-    """
-    Load lattice and township layers.
-    """
+def load_layers() -> tuple[gpd.GeoDataFrame, gpd.GeoDataFrame]:
     if not LATTICE_PATH.exists():
-        raise FileNotFoundError(f"Lattice file not found:\n{LATTICE_PATH}")
-
-    if not TOWNSHIP_SHP_PATH.exists():
-        raise FileNotFoundError(f"Township shapefile not found:\n{TOWNSHIP_SHP_PATH}")
-
+        raise FileNotFoundError(f"SMAP lattice not found: {LATTICE_PATH}")
     lattice = gpd.read_parquet(LATTICE_PATH)
-    townships = read_townships(TOWNSHIP_SHP_PATH)
-
-    if townships.crs != lattice.crs:
-        townships = townships.to_crs(lattice.crs)
-
+    if lattice.crs is None:
+        lattice = lattice.set_crs(f"EPSG:{cfg.CRS_EASE}")
+    townships = read_townships(lattice.crs, required=True)
+    assert townships is not None
     return lattice, townships
 
 
-# ============================================================
-# 3. Summaries
-# ============================================================
-
-def print_summary(lattice: gpd.GeoDataFrame, townships: gpd.GeoDataFrame) -> None:
-    """
-    Print quick layer summaries.
-    """
-    print("\nSMAP lattice")
-    print("-" * 60)
-    print(f"CRS:        {lattice.crs}")
-    print(f"Pixels:     {len(lattice)}")
-    print(f"Bounds:     {lattice.total_bounds}")
-    print(f"Columns:    {list(lattice.columns)}")
-
-    print("\nIowa townships")
-    print("-" * 60)
-    print(f"CRS:        {townships.crs}")
-    print(f"Townships:  {len(townships)}")
-    print(f"Bounds:     {townships.total_bounds}")
-    print(f"Columns:    {list(townships.columns)}")
-
-
-# ============================================================
-# 4. Plot helpers
-# ============================================================
-
-def clean_axis(ax, title: str) -> None:
-    """
-    Minimal map style.
-    """
-    ax.set_title(title, fontsize=13, pad=10)
-    ax.set_axis_off()
+def set_extent(ax, layer: gpd.GeoDataFrame, pad: float = 0.035) -> None:
+    xmin, ymin, xmax, ymax = layer.total_bounds
+    dx = max(xmax - xmin, 1.0) * pad
+    dy = max(ymax - ymin, 1.0) * pad
+    ax.set_xlim(xmin - dx, xmax + dx)
+    ax.set_ylim(ymin - dy, ymax + dy)
     ax.set_aspect("equal")
+    ax.set_axis_off()
 
-
-def set_iowa_extent(ax, townships: gpd.GeoDataFrame, pad_fraction: float = 0.04) -> None:
-    """
-    Set map extent using township bounds plus a small padding.
-    """
-    xmin, ymin, xmax, ymax = townships.total_bounds
-    x_pad = (xmax - xmin) * pad_fraction
-    y_pad = (ymax - ymin) * pad_fraction
-
-    ax.set_xlim(xmin - x_pad, xmax + x_pad)
-    ax.set_ylim(ymin - y_pad, ymax + y_pad)
-
-
-def save_pdf(fig, filename: str) -> None:
-    """
-    Save figure as PDF only.
-    """
-    out_path = FIG_DIR / filename
-    fig.savefig(out_path, bbox_inches="tight")
-    plt.close(fig)
-    print(f"Saved: {out_path}")
-
-
-# ============================================================
-# 5. Figure 1: side-by-side
-# ============================================================
 
 def plot_side_by_side(lattice: gpd.GeoDataFrame, townships: gpd.GeoDataFrame) -> None:
-    """
-    Side-by-side comparison of SMAP lattice and Iowa townships.
-    """
-    fig, axes = plt.subplots(1, 2, figsize=(14, 7))
+    fig, axes = plt.subplots(1, 2, figsize=(14, 7), constrained_layout=True)
+    lattice.plot(ax=axes[0], facecolor="none", edgecolor="0.20", linewidth=0.45)
+    townships.boundary.plot(ax=axes[1], color="0.25", linewidth=0.30)
+    set_extent(axes[0], townships)
+    set_extent(axes[1], townships)
+    axes[0].set_title(f"SMAP lattice ({len(lattice):,} pixels)")
+    axes[1].set_title(f"Iowa civil townships ({len(townships):,})")
+    fig.suptitle("Spatial supports used in the SMAP gap-filling workflow", fontsize=15)
+    save_figure(fig, OUT_DIR / "lattice_and_townships_side_by_side")
 
-    lattice.plot(
-        ax=axes[0],
-        facecolor="none",
-        edgecolor="#1f3b73",
-        linewidth=0.35,
-    )
-    set_iowa_extent(axes[0], townships)
-    clean_axis(axes[0], "SMAP Lattice")
-
-    townships.plot(
-        ax=axes[1],
-        facecolor="#f7f7f7",
-        edgecolor="#4a4a4a",
-        linewidth=0.25,
-    )
-    set_iowa_extent(axes[1], townships)
-    clean_axis(axes[1], "Iowa Civil Townships")
-
-    fig.suptitle("SMAP Lattice and Iowa Township Boundaries", fontsize=15, y=0.98)
-    plt.tight_layout()
-
-    save_pdf(fig, "01_lattice_townships_side_by_side.pdf")
-
-
-# ============================================================
-# 6. Figure 2: full overlay
-# ============================================================
 
 def plot_overlay(lattice: gpd.GeoDataFrame, townships: gpd.GeoDataFrame) -> None:
-    """
-    Overlay SMAP lattice on Iowa township boundaries.
-    """
-    fig, ax = plt.subplots(figsize=(9.5, 8))
-
-    townships.plot(
-        ax=ax,
-        facecolor="#f7f7f7",
-        edgecolor="#5a5a5a",
-        linewidth=0.25,
-    )
-
-    lattice.plot(
-        ax=ax,
-        facecolor="none",
-        edgecolor="#1f3b73",
-        linewidth=0.45,
-        alpha=0.9,
-    )
-
-    set_iowa_extent(ax, townships)
-    clean_axis(ax, "SMAP Lattice Overlaid on Iowa Townships")
-    plt.tight_layout()
-
-    save_pdf(fig, "02_lattice_townships_overlay.pdf")
+    fig, ax = plt.subplots(figsize=(10, 7.8))
+    townships.plot(ax=ax, facecolor="0.96", edgecolor="0.50", linewidth=0.25)
+    lattice.boundary.plot(ax=ax, color="0.10", linewidth=0.50)
+    set_extent(ax, townships)
+    ax.set_title("SMAP lattice over Iowa civil townships")
+    fig.tight_layout()
+    save_figure(fig, OUT_DIR / "lattice_over_townships")
 
 
-# ============================================================
-# 7. Figure 3: zoomed overlay
-# ============================================================
-
-def plot_zoomed_overlay(lattice: gpd.GeoDataFrame, townships: gpd.GeoDataFrame) -> None:
-    """
-    Zoomed view to show mismatch between SMAP pixels and township boundaries.
-    """
+def plot_zoom(lattice: gpd.GeoDataFrame, townships: gpd.GeoDataFrame) -> None:
     xmin, ymin, xmax, ymax = townships.total_bounds
-
-    x_center = (xmin + xmax) / 2
-    y_center = (ymin + ymax) / 2
-
-    x_buffer = (xmax - xmin) * 0.16
-    y_buffer = (ymax - ymin) * 0.16
-
-    x0, x1 = x_center - x_buffer, x_center + x_buffer
-    y0, y1 = y_center - y_buffer, y_center + y_buffer
-
-    lattice_zoom = lattice.cx[x0:x1, y0:y1]
-    townships_zoom = townships.cx[x0:x1, y0:y1]
+    xc, yc = (xmin + xmax) / 2, (ymin + ymax) / 2
+    width = (xmax - xmin) * 0.32
+    height = (ymax - ymin) * 0.32
+    x0, x1 = xc - width / 2, xc + width / 2
+    y0, y1 = yc - height / 2, yc + height / 2
 
     fig, ax = plt.subplots(figsize=(8, 8))
-
-    townships_zoom.plot(
-        ax=ax,
-        facecolor="#f7f7f7",
-        edgecolor="#4a4a4a",
-        linewidth=0.45,
+    townships.cx[x0:x1, y0:y1].plot(
+        ax=ax, facecolor="0.97", edgecolor="0.40", linewidth=0.45
     )
-
-    lattice_zoom.plot(
-        ax=ax,
-        facecolor="none",
-        edgecolor="#1f3b73",
-        linewidth=0.9,
-        alpha=0.95,
-    )
-
+    lattice.cx[x0:x1, y0:y1].boundary.plot(ax=ax, color="0.10", linewidth=0.90)
     ax.set_xlim(x0, x1)
     ax.set_ylim(y0, y1)
+    ax.set_aspect("equal")
+    ax.set_axis_off()
+    ax.set_title("Zoomed comparison of pixel and township boundaries")
+    fig.tight_layout()
+    save_figure(fig, OUT_DIR / "lattice_township_zoom")
 
-    clean_axis(ax, "Zoomed Overlay: SMAP Pixels and Townships")
-    plt.tight_layout()
-
-    save_pdf(fig, "03_lattice_townships_overlay_zoom.pdf")
-
-
-# ============================================================
-# 8. Main
-# ============================================================
 
 def main() -> None:
-    lattice, townships = load_data()
-
-    print_summary(lattice, townships)
-
+    lattice, townships = load_layers()
+    print("02: Visualize SMAP lattice")
+    print(f"Lattice:   {LATTICE_PATH}")
+    print(f"Pixels:    {len(lattice):,}")
+    print(f"Townships: {len(townships):,}")
+    print(f"Output:    {OUT_DIR}")
     plot_side_by_side(lattice, townships)
     plot_overlay(lattice, townships)
-    plot_zoomed_overlay(lattice, townships)
-
-    print("\nDone. PDF figures saved only.")
+    plot_zoom(lattice, townships)
+    print("Done.")
 
 
 if __name__ == "__main__":
